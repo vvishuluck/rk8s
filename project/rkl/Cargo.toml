@@ -71,7 +71,7 @@ hickory-proto = { workspace = true }
 hickory-resolver = { workspace = true }
 async-trait = { workspace = true }
 hickory-client = { workspace = true }
-
+nftables = { workspace = true }
 protobuf = { workspace = true }
 prost = "0.13.5"
 prost-types = "0.12.6"

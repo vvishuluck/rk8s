@@ -3,3 +3,4 @@ pub mod iface;
 pub mod ip;
 pub mod route;
 pub mod subnet;
+pub mod nftables;
