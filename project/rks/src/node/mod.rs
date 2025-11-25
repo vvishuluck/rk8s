@@ -59,6 +59,12 @@ impl NodeRegistry {
         let inner = self.inner.lock().await;
         inner.get(node_id).cloned()
     }
+
+    /// Return a snapshot of all registered worker sessions.
+    pub async fn list_sessions(&self) -> Vec<(String, Arc<WorkerSession>)> {
+        let inner = self.inner.lock().await;
+        inner.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
 }
 
 pub struct RksNode {

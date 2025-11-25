@@ -11,6 +11,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
+use nftables::{helper, schema};
+use tokio::task;
+use serde_json;
 
 /// Main network configuration receiver that coordinates subnet and route configuration
 /// This will be the primary interface for receiving network configurations from rks
@@ -248,6 +251,22 @@ impl NetworkReceiver {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Apply nftables rules payload (JSON) using `nftables` crate helper.
+    pub async fn apply_nft_rules(&self, rules: String) -> Result<()> {
+        info!("Applying nftables rules on node {} (len={})", self.node_id, rules.len());
+
+        let rules_clone = rules.clone();
+        let _res = task::spawn_blocking(move || -> anyhow::Result<()> {
+            let nft: schema::Nftables = serde_json::from_str(&rules_clone)?;
+            helper::apply_ruleset(&nft)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("nft task join error: {e}"))??;
 
         Ok(())
     }
