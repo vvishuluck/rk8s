@@ -3,11 +3,10 @@ use crate::api::xlinestore::XlineStore;
 use crate::controllers::manager::{Controller, ResourceWatchResponse, WatchEvent};
 use crate::node::NodeRegistry;
 use async_trait::async_trait;
-use common::{self, ResourceKind};
+use common::{self, ResourceKind, NetworkUpdate, NetworkUpdateOp, RksMessage};
 use std::sync::Arc;
 use log::{info, warn};
-use chrono::Utc;
-use serde_json;
+// removed unused imports after switching to local rule storage only
 use serde_yaml;
 
 
@@ -16,6 +15,8 @@ use serde_yaml;
 pub struct NftablesController {
     xline_store: Arc<XlineStore>,
     node_registry: Arc<NodeRegistry>,
+    last_full_rules: Option<String>,
+    last_incremental_rules: Vec<String>,
 }
 
 impl NftablesController {
@@ -23,10 +24,20 @@ impl NftablesController {
         Self {
             xline_store,
             node_registry,
+            last_full_rules: None,
+            last_incremental_rules: Vec::new(),
         }
     }
 
-    async fn sync_rules(&self) -> Result<()> {
+    pub fn last_full_rules(&self) -> Option<&str> {
+        self.last_full_rules.as_deref()
+    }
+
+    pub fn incremental_rules(&self) -> &[String] {
+        &self.last_incremental_rules
+    }
+
+    async fn sync_rules(&mut self) -> Result<()> {
         let (services_raw, _srev) = self.xline_store.services_snapshot_with_rev().await?;
         let (endpoints_raw, _erev) = self.xline_store.endpoints_snapshot_with_rev().await?;
 
@@ -46,140 +57,84 @@ impl NftablesController {
             }
         }
 
-        let state = common::NetworkState {
-            services,
-            endpoints,
-            resource_version: Utc::now().to_rfc3339(),
-        };
-
-        self.broadcast_state(state).await
+        let rules = generate_nftables_config(&services, &endpoints)?;
+        self.last_full_rules = Some(rules);
+        Ok(())
     }
 
-    async fn broadcast_state(&self, state: common::NetworkState) -> Result<()> {
+    // Store incremental rules locally and broadcast them to all registered nodes.
+    async fn store_incremental_rules(&mut self, rules: String, update: NetworkUpdate) -> Result<()> {
+        self.last_incremental_rules.push(rules);
+
         let sessions = self.node_registry.list_sessions().await;
         if sessions.is_empty() {
             return Ok(());
         }
 
-        info!("Broadcasting network state (ver={}) to {} nodes", state.resource_version, sessions.len());
-        let msg = common::RksMessage::SetNetworkState(state);
-        
+        info!("Broadcasting incremental nftables update to {} nodes", sessions.len());
+        let msg = RksMessage::UpdateNetworkState(update);
+
         for (node_id, session) in sessions {
             if let Err(e) = session.tx.try_send(msg.clone()) {
-                warn!("Failed to send state to node {}: {}", node_id, e);
+                warn!("Failed to send incremental rules to node {}: {}", node_id, e);
             }
         }
         Ok(())
     }
 
-    async fn broadcast_update(&self, update: common::NetworkUpdate) -> Result<()> {
-        let sessions = self.node_registry.list_sessions().await;
-        if sessions.is_empty() {
-            return Ok(());
-        }
-
-        info!("Broadcasting network update (op={:?}) to {} nodes", update.op, sessions.len());
-        let msg = common::RksMessage::UpdateNetworkState(update);
-        
-        for (node_id, session) in sessions {
-            if let Err(e) = session.tx.try_send(msg.clone()) {
-                warn!("Failed to send update to node {}: {}", node_id, e);
-            }
-        }
-        Ok(())
-    }
-
-    // Helper to fetch a specific service from the store (using snapshot for now)
+    // Fetch a specific service object via XlineStore helper.
+    // XlineStore stores services under keys like "/registry/services/specs/<ns>/<name>"
+    // and its `get_service` expects the service name used when inserting (e.g. "specs/<ns>/<name>").
     async fn get_service(&self, ns: &str, name: &str) -> Result<Option<common::ServiceTask>> {
-        let (services_raw, _) = self.xline_store.services_snapshot_with_rev().await?;
-        // Key format: /registry/services/specs/<ns>/<name>
-        let suffix = format!("/{}/{}", ns, name);
-        for (key, yaml) in services_raw {
-            if key.ends_with(&suffix) {
-                return Ok(Some(serde_yaml::from_str(&yaml)?));
-            }
-        }
-        Ok(None)
+        let svc_key = format!("specs/{}/{}", ns, name);
+        self.xline_store.get_service(&svc_key).await
     }
 
-    // Helper to fetch a specific endpoint from the store
-    async fn get_endpoint(&self, ns: &str, name: &str) -> Result<Option<common::Endpoint>> {
-        let (endpoints_raw, _) = self.xline_store.endpoints_snapshot_with_rev().await?;
-        let suffix = format!("/{}/{}", ns, name);
-        for (key, yaml) in endpoints_raw {
-            if key.ends_with(&suffix) {
-                return Ok(Some(serde_yaml::from_str(&yaml)?));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn process_upsert(&self, ns: &str, name: &str, kind: ResourceKind, yaml: &str) -> Result<()> {
-        let (svc, ep) = match kind {
-            ResourceKind::Service => {
-                let svc: common::ServiceTask = serde_yaml::from_str(yaml)?;
-                let ep = self.get_endpoint(ns, name).await?.unwrap_or_else(|| common::Endpoint {
-                    api_version: "v1".into(),
-                    kind: "Endpoints".into(),
-                    metadata: svc.metadata.clone(),
-                    subsets: vec![],
-                });
-                (svc, ep)
-            }
-            ResourceKind::Endpoint => {
-                let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
-                let svc = match self.get_service(ns, name).await? {
-                    Some(s) => s,
-                    None => return Ok(()), // Endpoint without Service is orphan, ignore
-                };
-                (svc, ep)
-            }
-            _ => return Ok(()),
+    // Only handle Endpoint upserts: Services are not watched to reduce noise.
+    async fn process_upsert(&mut self, _ns: &str, _name: &str, _kind: ResourceKind, yaml: &str) -> Result<()> {
+        let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
+        // Service name is expected to match endpoint metadata (namespace + name)
+        let ns = &ep.metadata.namespace;
+        let name = &ep.metadata.name;
+        let svc = match self.get_service(ns, name).await? {
+            Some(s) => s,
+            None => return Ok(()), // Endpoint without Service is orphan, ignore
         };
 
-        let update = common::NetworkUpdate {
-            op: common::NetworkUpdateOp::Put,
+        let rules = generate_service_update(&svc, &ep)?;
+        info!("Stored incremental rules for endpoint {}/{}", ns, name);
+
+        let update = NetworkUpdate {
+            op: NetworkUpdateOp::Put,
             service: Some(svc),
             endpoint: Some(ep),
-            resource_version: Utc::now().to_rfc3339(),
+            resource_version: "".to_string(),
         };
-        
-        info!("Incremental upsert for {}/{}", ns, name);
-        self.broadcast_update(update).await
+
+        self.store_incremental_rules(rules, update).await
     }
 
-    async fn process_delete(&self, _ns: &str, _name: &str, kind: ResourceKind, yaml: &str) -> Result<()> {
-        if kind == ResourceKind::Service {
-            let svc: common::ServiceTask = serde_yaml::from_str(yaml)?;
-            let update = common::NetworkUpdate {
-                op: common::NetworkUpdateOp::Delete,
-                service: Some(svc),
-                endpoint: None,
-                resource_version: Utc::now().to_rfc3339(),
+    // Only handle Endpoint deletions: generate reject/cleanup rules when endpoints are removed.
+    async fn process_delete(&mut self, _ns: &str, _name: &str, _kind: ResourceKind, yaml: &str) -> Result<()> {
+        let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
+        if let Some(svc) = self.get_service(&ep.metadata.namespace, &ep.metadata.name).await? {
+            let empty_ep = common::Endpoint {
+                api_version: "v1".into(),
+                kind: "Endpoints".into(),
+                metadata: ep.metadata.clone(),
+                subsets: vec![],
             };
-            info!("Incremental delete for Service {}", update.service.as_ref().unwrap().metadata.name);
-            self.broadcast_update(update).await?;
-        }
-        // If Endpoint is deleted, Service usually updates to empty endpoints or is deleted too.
-        if kind == ResourceKind::Endpoint {
-             let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
-             if let Some(svc) = self.get_service(&ep.metadata.namespace, &ep.metadata.name).await? {
-                 // Regenerate service rules with empty endpoint (Reject rules)
-                 let empty_ep = common::Endpoint {
-                     api_version: "v1".into(),
-                     kind: "Endpoints".into(),
-                     metadata: ep.metadata.clone(),
-                     subsets: vec![],
-                 };
-                 let update = common::NetworkUpdate {
-                    op: common::NetworkUpdateOp::Put,
-                    service: Some(svc),
-                    endpoint: Some(empty_ep),
-                    resource_version: Utc::now().to_rfc3339(),
-                };
-                 info!("Incremental update (Endpoint deleted) for Service {}", update.service.as_ref().unwrap().metadata.name);
-                 self.broadcast_update(update).await?;
-             }
+            let rules = generate_service_update(&svc, &empty_ep)?; // Reject rules
+            info!("Stored incremental empty-endpoints rules for Service {}", svc.metadata.name);
+
+            let update = NetworkUpdate {
+                op: NetworkUpdateOp::Put,
+                service: Some(svc),
+                endpoint: Some(empty_ep),
+                resource_version: "".to_string(),
+            };
+
+            self.store_incremental_rules(rules, update).await?;
         }
         Ok(())
     }
@@ -192,12 +147,13 @@ impl Controller for NftablesController {
     }
 
     async fn init(&mut self) -> Result<()> {
-        info!("Initializing NftablesController, performing initial full sync...");
+        info!("Initializing NftablesController (local rule generation only)...");
         self.sync_rules().await
     }
 
+    // Only watch Endpoints; Service objects are looked up on-demand.
     fn watch_resources(&self) -> Vec<ResourceKind> {
-        vec![ResourceKind::Service, ResourceKind::Endpoint]
+        vec![ResourceKind::Endpoint]
     }
 
     async fn handle_watch_response(&mut self, response: &ResourceWatchResponse) -> Result<()> {
