@@ -91,7 +91,7 @@ impl NftablesController {
     }
 
     // Only handle Endpoint upserts: Services are not watched to reduce noise.
-    async fn process_upsert(&mut self, _ns: &str, _name: &str, _kind: ResourceKind, yaml: &str) -> Result<()> {
+    async fn process_upsert(&mut self, yaml: &str) -> Result<()> {
         let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
         // Service name is expected to match endpoint metadata (namespace + name)
         let ns = &ep.metadata.namespace;
@@ -115,7 +115,7 @@ impl NftablesController {
     }
 
     // Only handle Endpoint deletions: generate reject/cleanup rules when endpoints are removed.
-    async fn process_delete(&mut self, _ns: &str, _name: &str, _kind: ResourceKind, yaml: &str) -> Result<()> {
+    async fn process_delete(&mut self, yaml: &str) -> Result<()> {
         let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
         if let Some(svc) = self.get_service(&ep.metadata.namespace, &ep.metadata.name).await? {
             let empty_ep = common::Endpoint {
@@ -157,22 +157,17 @@ impl Controller for NftablesController {
     }
 
     async fn handle_watch_response(&mut self, response: &ResourceWatchResponse) -> Result<()> {
-        // Parse key to extract namespace and name
-        // Key format example: /registry/services/specs/default/my-service
-        let parts: Vec<&str> = response.key.split('/').collect();
-        if parts.len() < 2 {
-            warn!("Invalid key format: {}", response.key);
+        // We only watch Endpoints in this controller.
+        if response.kind != ResourceKind::Endpoint {
             return Ok(());
         }
-        let name = parts.last().unwrap();
-        let namespace = parts.get(parts.len() - 2).unwrap_or(&"default");
 
         match &response.event {
             WatchEvent::Add { yaml } | WatchEvent::Update { new_yaml: yaml, .. } => {
-                self.process_upsert(namespace, name, response.kind.clone(), yaml).await?;
+                self.process_upsert(yaml).await?;
             }
             WatchEvent::Delete { yaml } => {
-                self.process_delete(namespace, name, response.kind.clone(), yaml).await?;
+                self.process_delete(yaml).await?;
             }
         }
         Ok(())
