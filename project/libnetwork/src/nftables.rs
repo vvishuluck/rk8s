@@ -1,21 +1,40 @@
 use anyhow::Result;
 use common;
-use nftables::{batch::Batch, schema, types, expr, stmt};
-use serde_json::{self, json};
+use nftables::{schema, types, expr, stmt};
+use serde_json::{self, json, Value};
 
 /// Generates the FULL configuration (Table, Base Chains, Maps, and all Service Chains).
 /// Used for initialization.
 pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[common::Endpoint]) -> Result<String> {
-    let mut batch = Batch::new();
+    // We use a vector of Values to mix crate-generated objects and manual JSON (for unsupported features like verdict maps).
+    let mut objects: Vec<Value> = Vec::new();
+
+    // Helper to push NfObject
+    macro_rules! push_obj {
+        ($obj:expr) => {
+            objects.push(serde_json::to_value($obj).expect("serialization failed"));
+        };
+    }
 
     // 1. Base Table
-    batch.add(schema::NfListObject::Table(schema::Table {
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Table(schema::Table {
         family: types::NfFamily::IP,
         name: "rk8s".into(),
         ..Default::default()
-    }));
+    })));
 
-    // 2. Base Chains (NAT & Filter)
+    // 2. Flush Table (Command) - Ensure we start clean
+    // Flush expects FlushObject. We use serde to construct it to avoid variant guessing.
+    push_obj!(schema::NfObject::CmdObject(schema::NfCmd::Flush(
+        serde_json::from_value(json!({
+            "table": {
+                "family": "ip",
+                "name": "rk8s"
+            }
+        })).expect("valid flush object")
+    )));
+
+    // 3. Base Chains (NAT & Filter)
     let base_chains = vec![
         ("nat-prerouting", types::NfChainType::NAT, types::NfHook::Prerouting, -100, None),
         ("nat-output", types::NfChainType::NAT, types::NfHook::Output, -100, None),
@@ -27,7 +46,7 @@ pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[c
     ];
 
     for (name, ctype, hook, prio, policy) in base_chains {
-        batch.add(schema::NfListObject::Chain(schema::Chain {
+        push_obj!(schema::NfObject::ListObject(schema::NfListObject::Chain(schema::Chain {
             family: types::NfFamily::IP,
             table: "rk8s".into(),
             name: name.into(),
@@ -36,219 +55,225 @@ pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[c
             prio: Some(prio),
             policy,
             ..Default::default()
+        })));
+    }
+
+    // 4. Custom Chains
+    let custom_chains = vec!["services", "services_tcp", "services_udp", "masquerade"];
+    for name in custom_chains {
+        push_obj!(schema::NfObject::ListObject(schema::NfListObject::Chain(schema::Chain {
+            family: types::NfFamily::IP,
+            table: "rk8s".into(),
+            name: name.into(),
+            ..Default::default()
+        })));
+    }
+
+    // 5. Maps (Manual JSON)
+    // nftables crate SetType does not support "verdict", so we must use manual JSON.
+    let maps = vec![
+        ("service_map_tcp", vec!["ipv4_addr", "inet_service"]),
+        ("service_map_udp", vec!["ipv4_addr", "inet_service"]),
+        ("nodeport_map_tcp", vec!["inet_service"]),
+        ("nodeport_map_udp", vec!["inet_service"]),
+    ];
+
+    for (name, map_types) in maps {
+        let type_val = if map_types.len() == 1 {
+            json!(map_types[0])
+        } else {
+            json!(map_types)
+        };
+
+        objects.push(json!({
+            "map": {
+                "family": "ip",
+                "table": "rk8s",
+                "name": name,
+                "type": type_val,
+                "map": "verdict",
+                "flags": ["interval"]
+            }
         }));
     }
 
-    // 3. Custom Chains
-    batch.add(schema::NfListObject::Chain(schema::Chain {
-        family: types::NfFamily::IP,
-        table: "rk8s".into(),
-        name: "services".into(),
-        ..Default::default()
-    }));
-    batch.add(schema::NfListObject::Chain(schema::Chain {
-        family: types::NfFamily::IP,
-        table: "rk8s".into(),
-        name: "services_tcp".into(),
-        ..Default::default()
-    }));
-    batch.add(schema::NfListObject::Chain(schema::Chain {
-        family: types::NfFamily::IP,
-        table: "rk8s".into(),
-        name: "services_udp".into(),
-        ..Default::default()
-    }));
-    batch.add(schema::NfListObject::Chain(schema::Chain {
-        family: types::NfFamily::IP,
-        table: "rk8s".into(),
-        name: "masquerade".into(),
-        ..Default::default()
-    }));
-
-    // 4. Base Rules (Jumps)
+    // 6. Base Rules (Jumps)
     let jumps = vec![
         ("nat-prerouting", "services"),
         ("nat-output", "services"),
         ("nat-postrouting", "masquerade"),
     ];
     for (chain, target) in jumps {
-        batch.add(schema::NfListObject::Rule(schema::Rule {
+        push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
             family: types::NfFamily::IP,
             table: "rk8s".into(),
             chain: chain.into(),
-            expr: std::borrow::Cow::Owned(vec![
+            expr: vec![
                 stmt::Statement::Jump(stmt::JumpTarget { target: target.into() })
-            ]),
+            ].into(),
             ..Default::default()
-        }));
+        })));
     }
 
-    // 5. Masquerade Rules
+    // 7. Dispatch Rules in `services` chain
+    // TCP
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "services".into(),
+        expr: vec![
+            stmt::Statement::Match(stmt::Match {
+                left: json_to_expr(json!({ "meta": { "key": "l4proto" } })),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::String("tcp".into()),
+            }),
+            stmt::Statement::Jump(stmt::JumpTarget { target: "services_tcp".into() })
+        ].into(),
+        ..Default::default()
+    })));
+    // UDP
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "services".into(),
+        expr: vec![
+            stmt::Statement::Match(stmt::Match {
+                left: json_to_expr(json!({ "meta": { "key": "l4proto" } })),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::String("udp".into()),
+            }),
+            stmt::Statement::Jump(stmt::JumpTarget { target: "services_udp".into() })
+        ].into(),
+        ..Default::default()
+    })));
+
+    // 8. VMap Rules (ClusterIP)
+    // TCP: daddr . dport -> @service_map_tcp
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "services_tcp".into(),
+        expr: vec![
+            json_to_stmt(json!({
+                "vmap": {
+                    "key": {
+                        "concat": [
+                            { "payload": { "protocol": "ip", "field": "daddr" } },
+                            { "payload": { "protocol": "tcp", "field": "dport" } }
+                        ]
+                    },
+                    "data": "@service_map_tcp"
+                }
+            }))
+        ].into(),
+        ..Default::default()
+    })));
+    // UDP
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "services_udp".into(),
+        expr: vec![
+            json_to_stmt(json!({
+                "vmap": {
+                    "key": {
+                        "concat": [
+                            { "payload": { "protocol": "ip", "field": "daddr" } },
+                            { "payload": { "protocol": "udp", "field": "dport" } }
+                        ]
+                    },
+                    "data": "@service_map_udp"
+                }
+            }))
+        ].into(),
+        ..Default::default()
+    })));
+
+    // 9. NodePort Rules (fib type local)
+    // TCP
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "services_tcp".into(),
+        expr: vec![
+            stmt::Statement::Match(stmt::Match {
+                left: json_to_expr(json!({ "fib": { "result": "type", "flags": ["daddr"] } })),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::String("local".into()),
+            }),
+            json_to_stmt(json!({
+                "vmap": {
+                    "key": { "payload": { "protocol": "tcp", "field": "dport" } },
+                    "data": "@nodeport_map_tcp"
+                }
+            }))
+        ].into(),
+        ..Default::default()
+    })));
+    // UDP
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "services_udp".into(),
+        expr: vec![
+            stmt::Statement::Match(stmt::Match {
+                left: json_to_expr(json!({ "fib": { "result": "type", "flags": ["daddr"] } })),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::String("local".into()),
+            }),
+            json_to_stmt(json!({
+                "vmap": {
+                    "key": { "payload": { "protocol": "udp", "field": "dport" } },
+                    "data": "@nodeport_map_udp"
+                }
+            }))
+        ].into(),
+        ..Default::default()
+    })));
+
+    // 10. Masquerade Rules
     let mark_match_stmt = stmt::Statement::Match(stmt::Match {
         left: expr::Expression::BinaryOperation(Box::new(expr::BinaryOperation::AND(
-            expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta {
-                key: expr::MetaKey::Mark,
-            })),
+            json_to_expr(json!({ "meta": { "key": "mark" } })),
             expr::Expression::Number(0x4000),
         ))),
         right: expr::Expression::Number(0),
         op: stmt::Operator::NEQ,
     });
-    batch.add(schema::NfListObject::Rule(schema::Rule {
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
         family: types::NfFamily::IP,
         table: "rk8s".into(),
         chain: "masquerade".into(),
-        expr: std::borrow::Cow::Owned(vec![
+        expr: vec![
             mark_match_stmt,
             stmt::Statement::Masquerade(None)
-        ]),
+        ].into(),
         comment: Some("rk8s-masquerade-marked".into()),
         ..Default::default()
-    }));
+    })));
 
-    // Convert Batch to JSON Value to inject Maps and VMap rules
-    let nftables = batch.to_nftables();
-    let mut json_value = serde_json::to_value(&nftables)?;
+    // Hairpin Rule
+    push_obj!(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
+        family: types::NfFamily::IP,
+        table: "rk8s".into(),
+        chain: "masquerade".into(),
+        expr: vec![
+            // ct status & 2 != 0 (DNAT bit)
+            stmt::Statement::Match(stmt::Match {
+                left: expr::Expression::BinaryOperation(Box::new(expr::BinaryOperation::AND(
+                    json_to_expr(json!({ "ct": { "key": "status" } })),
+                    expr::Expression::Number(2),
+                ))),
+                op: stmt::Operator::NEQ,
+                right: expr::Expression::Number(0),
+            }),
+            stmt::Statement::Masquerade(None)
+        ].into(),
+        comment: Some("rk8s-masquerade-hairpin".into()),
+        ..Default::default()
+    })));
 
-    if let Some(arr) = json_value.get_mut("nftables").and_then(|v| v.as_array_mut()) {
-        // A. Flush Table (First command)
-        let flush_cmd = json!({
-            "flush": { "table": { "family": "ip", "name": "rk8s" } }
-        });
-        if !arr.is_empty() { arr.insert(1, flush_cmd); }
-
-        // B. Inject Maps (service_map_tcp, service_map_udp)
-        let map_tcp = json!({
-            "add": { "map": {
-                "family": "ip", "table": "rk8s", "name": "service_map_tcp",
-                "type": ["ipv4_addr", "inet_service"], "map": "verdict",
-                "flags": ["interval"]
-            }}
-        });
-        let map_udp = json!({
-            "add": { "map": {
-                "family": "ip", "table": "rk8s", "name": "service_map_udp",
-                "type": ["ipv4_addr", "inet_service"], "map": "verdict",
-                "flags": ["interval"]
-            }}
-        });
-        let nodeport_map_tcp = json!({
-            "add": { "map": {
-                "family": "ip", "table": "rk8s", "name": "nodeport_map_tcp",
-                "type": "inet_service", "map": "verdict",
-                "flags": ["interval"]
-            }}
-        });
-        let nodeport_map_udp = json!({
-            "add": { "map": {
-                "family": "ip", "table": "rk8s", "name": "nodeport_map_udp",
-                "type": "inet_service", "map": "verdict",
-                "flags": ["interval"]
-            }}
-        });
-        arr.push(map_tcp);
-        arr.push(map_udp);
-        arr.push(nodeport_map_tcp);
-        arr.push(nodeport_map_udp);
-
-        // C. Inject Dispatch Rules in `services` chain
-        arr.push(json!({
-            "add": { "rule": {
-                "family": "ip", "table": "rk8s", "chain": "services",
-                "expr": [
-                    { "match": { "left": { "meta": { "key": "l4proto" } }, "op": "==", "right": "tcp" } },
-                    { "jump": { "target": "services_tcp" } }
-                ]
-            }}
-        }));
-        arr.push(json!({
-            "add": { "rule": {
-                "family": "ip", "table": "rk8s", "chain": "services",
-                "expr": [
-                    { "match": { "left": { "meta": { "key": "l4proto" } }, "op": "==", "right": "udp" } },
-                    { "jump": { "target": "services_udp" } }
-                ]
-            }}
-        }));
-
-        // D. Inject VMap Rules in `services_tcp` and `services_udp`
-        // ClusterIP rules first (Priority)
-        arr.push(json!({
-            "add": { "rule": {
-                "family": "ip", "table": "rk8s", "chain": "services_tcp",
-                "expr": [
-                    { "vmap": {
-                        "left": { "concat": [
-                            { "payload": { "protocol": "ip", "field": "daddr" } },
-                            { "payload": { "protocol": "tcp", "field": "dport" } }
-                        ]},
-                        "map": "@service_map_tcp"
-                    }}
-                ]
-            }}
-        }));
-        arr.push(json!({
-            "add": { "rule": {
-                "family": "ip", "table": "rk8s", "chain": "services_udp",
-                "expr": [
-                    { "vmap": {
-                        "left": { "concat": [
-                            { "payload": { "protocol": "ip", "field": "daddr" } },
-                            { "payload": { "protocol": "udp", "field": "dport" } }
-                        ]},
-                        "map": "@service_map_udp"
-                    }}
-                ]
-            }}
-        }));
-
-        // NodePort rules (Secondary, with fib check)
-        arr.push(json!({
-            "add": { "rule": {
-                "family": "ip", "table": "rk8s", "chain": "services_tcp",
-                "expr": [
-                    { "match": {
-                        "left": { "fib": { "result": "type", "flags": ["daddr"] } },
-                        "op": "==", "right": "local"
-                    }},
-                    { "vmap": {
-                        "left": { "payload": { "protocol": "tcp", "field": "dport" } },
-                        "map": "@nodeport_map_tcp"
-                    }}
-                ]
-            }}
-        }));
-        arr.push(json!({
-            "add": { "rule": {
-                "family": "ip", "table": "rk8s", "chain": "services_udp",
-                "expr": [
-                    { "match": {
-                        "left": { "fib": { "result": "type", "flags": ["daddr"] } },
-                        "op": "==", "right": "local"
-                    }},
-                    { "vmap": {
-                        "left": { "payload": { "protocol": "udp", "field": "dport" } },
-                        "map": "@nodeport_map_udp"
-                    }}
-                ]
-            }}
-        }));
-
-        // E. Inject Hairpin Rule
-        let hairpin_rule = json!({
-            "rule": {
-                "family": "ip", "table": "rk8s", "chain": "masquerade",
-                "expr": [
-                    { "match": { "left": { "&": [ { "ct": { "key": "status" } }, 2 ] }, "op": "!=", "right": 0 } },
-                    { "masquerade": null }
-                ],
-                "comment": "rk8s-masquerade-hairpin"
-            }
-        });
-        arr.push(hairpin_rule);
-    }
-
-    // 6. Generate Service Chains & Map Elements (Full Sync)
+    // 11. Generate Service Chains & Map Elements (Full Sync)
     let mut parsed_endpoints = std::collections::HashMap::new();
     for ep in endpoints {
         parsed_endpoints.insert((ep.metadata.namespace.clone(), ep.metadata.name.clone()), ep);
@@ -264,19 +289,21 @@ pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[c
                 subsets: vec![],
             });
         
+        // Generate service update as JSON (legacy/shared function)
         let update_json = generate_service_update(svc, &ep)?;
-        let update_val: serde_json::Value = serde_json::from_str(&update_json)?;
-        if let Some(cmds) = update_val.get("nftables").and_then(|v| v.as_array()) {
-            for cmd in cmds {
-                if let Some(arr) = json_value.get_mut("nftables").and_then(|v| v.as_array_mut()) {
-                    arr.push(cmd.clone());
-                }
-            }
+        
+        // Parse it back to Value to merge objects safely
+        let update_val: Value = serde_json::from_str(&update_json)?;
+        if let Some(arr) = update_val.get("nftables").and_then(|v| v.as_array()) {
+            objects.extend(arr.clone());
         }
     }
 
-    Ok(serde_json::to_string(&json_value)?)
+    Ok(json!({ "nftables": objects }).to_string())
 }
+
+
+
 
 /// Generates incremental update commands for a single Service.
 pub fn generate_service_update(svc: &common::ServiceTask, ep: &common::Endpoint) -> Result<String> {
@@ -453,14 +480,20 @@ pub fn generate_service_delete(svc: &common::ServiceTask) -> Result<String> {
         }));
 
         // 3. Delete Backend Map
-        // Note: map must be empty or we flush it? delete map usually requires it to be unreferenced.
-        // Since we deleted the chain using it, it should be fine.
         commands.push(json!({
             "delete": { "map": { "family": "ip", "table": "rk8s", "name": backend_map_name } }
         }));
     }
 
     Ok(json!({ "nftables": commands }).to_string())
+}
+
+fn json_to_stmt(v: Value) -> stmt::Statement<'static> {
+    serde_json::from_value(v).expect("valid statement json")
+}
+
+fn json_to_expr(v: Value) -> expr::Expression<'static> {
+    serde_json::from_value(v).expect("valid expression json")
 }
 
 #[cfg(test)]
@@ -522,10 +555,13 @@ mod tests {
 
         // 1. Check Map Flags (Interval)
         let map_tcp = cmds.iter().find(|c| {
-            c.get("add").and_then(|a| a.get("map")).and_then(|m| m.get("name")).and_then(|n| n.as_str()) == Some("service_map_tcp")
+            c.get("map").or_else(|| c.get("add").and_then(|a| a.get("map")))
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str()) == Some("service_map_tcp")
         }).expect("service_map_tcp not found");
         
-        let flags = map_tcp["add"]["map"]["flags"].as_array().expect("flags missing");
+        let map_obj = map_tcp.get("map").or_else(|| map_tcp.get("add").and_then(|a| a.get("map"))).unwrap();
+        let flags = map_obj["flags"].as_array().expect("flags missing");
         assert!(flags.iter().any(|f| f.as_str() == Some("interval")), "service_map_tcp missing interval flag");
 
         // 2. Check Backend Map Type
@@ -560,14 +596,19 @@ mod tests {
 
         // 5. Check VMap Syntax (Concatenation)
         let vmap_rule = cmds.iter().find(|c| {
-            c.get("add").and_then(|a| a.get("rule"))
-                .and_then(|r| r.get("chain").and_then(|n| n.as_str())) == Some("services_tcp")
+            let rule = c.get("rule").or_else(|| c.get("add").and_then(|a| a.get("rule")));
+            if let Some(r) = rule {
+                r.get("chain").and_then(|n| n.as_str()) == Some("services_tcp")
                 && c.to_string().contains("vmap")
                 && c.to_string().contains("service_map_tcp")
+            } else {
+                false
+            }
         }).expect("vmap rule not found");
 
-        let vmap_expr = vmap_rule["add"]["rule"]["expr"][0]["vmap"].as_object().unwrap();
-        assert!(vmap_expr["left"]["concat"].is_array(), "vmap left should be concat");
-        assert_eq!(vmap_expr["map"].as_str(), Some("@service_map_tcp"));
+        let rule_obj = vmap_rule.get("rule").or_else(|| vmap_rule.get("add").and_then(|a| a.get("rule"))).unwrap();
+        let vmap_expr = rule_obj["expr"][0]["vmap"].as_object().unwrap();
+        assert!(vmap_expr["key"]["concat"].is_array(), "vmap key should be concat");
+        assert_eq!(vmap_expr["data"].as_str(), Some("@service_map_tcp"));
     }
 }
