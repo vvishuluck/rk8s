@@ -91,51 +91,23 @@ impl NftablesController {
 
     // Helper to fetch a specific service from the store (using snapshot for now)
     async fn get_service(&self, ns: &str, name: &str) -> Result<Option<common::ServiceTask>> {
-        let (services_raw, _) = self.xline_store.services_snapshot_with_rev().await?;
-        // Key format: /registry/services/specs/<ns>/<name>
-        let suffix = format!("/{}/{}", ns, name);
-        for (key, yaml) in services_raw {
-            if key.ends_with(&suffix) {
-                return Ok(Some(serde_yaml::from_str(&yaml)?));
-            }
-        }
-        Ok(None)
+        let svc_key = format!("specs/{}/{}", ns, name);
+        self.xline_store.get_service(&svc_key).await
     }
 
-    // Helper to fetch a specific endpoint from the store
-    async fn get_endpoint(&self, ns: &str, name: &str) -> Result<Option<common::Endpoint>> {
-        let (endpoints_raw, _) = self.xline_store.endpoints_snapshot_with_rev().await?;
-        let suffix = format!("/{}/{}", ns, name);
-        for (key, yaml) in endpoints_raw {
-            if key.ends_with(&suffix) {
-                return Ok(Some(serde_yaml::from_str(&yaml)?));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn process_upsert(&self, ns: &str, name: &str, kind: ResourceKind, yaml: &str) -> Result<()> {
-        let (svc, ep) = match kind {
-            ResourceKind::Service => {
-                let svc: common::ServiceTask = serde_yaml::from_str(yaml)?;
-                let ep = self.get_endpoint(ns, name).await?.unwrap_or_else(|| common::Endpoint {
-                    api_version: "v1".into(),
-                    kind: "Endpoints".into(),
-                    metadata: svc.metadata.clone(),
-                    subsets: vec![],
-                });
-                (svc, ep)
-            }
-            ResourceKind::Endpoint => {
-                let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
-                let svc = match self.get_service(ns, name).await? {
-                    Some(s) => s,
-                    None => return Ok(()), // Endpoint without Service is orphan, ignore
-                };
-                (svc, ep)
-            }
-            _ => return Ok(()),
+    // Only handle Endpoint upserts: Services are not watched to reduce noise.
+    async fn process_upsert(&mut self, yaml: &str) -> Result<()> {
+        let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
+        // Service name is expected to match endpoint metadata (namespace + name)
+        let ns = &ep.metadata.namespace;
+        let name = &ep.metadata.name;
+        let svc = match self.get_service(ns, name).await? {
+            Some(s) => s,
+            None => return Ok(()), // Endpoint without Service is orphan, ignore
         };
+
+        let rules = generate_service_update(&svc, &ep)?;
+        info!("Stored incremental rules for endpoint {}/{}", ns, name);
 
         let update = common::NetworkUpdate {
             op: common::NetworkUpdateOp::Put,
@@ -148,38 +120,27 @@ impl NftablesController {
         self.broadcast_update(update).await
     }
 
-    async fn process_delete(&self, _ns: &str, _name: &str, kind: ResourceKind, yaml: &str) -> Result<()> {
-        if kind == ResourceKind::Service {
-            let svc: common::ServiceTask = serde_yaml::from_str(yaml)?;
-            let update = common::NetworkUpdate {
-                op: common::NetworkUpdateOp::Delete,
-                service: Some(svc),
-                endpoint: None,
-                resource_version: Utc::now().to_rfc3339(),
+    // Only handle Endpoint deletions: generate reject/cleanup rules when endpoints are removed.
+    async fn process_delete(&mut self, yaml: &str) -> Result<()> {
+        let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
+        if let Some(svc) = self.get_service(&ep.metadata.namespace, &ep.metadata.name).await? {
+            let empty_ep = common::Endpoint {
+                api_version: "v1".into(),
+                kind: "Endpoints".into(),
+                metadata: ep.metadata.clone(),
+                subsets: vec![],
             };
-            info!("Incremental delete for Service {}", update.service.as_ref().unwrap().metadata.name);
-            self.broadcast_update(update).await?;
-        }
-        // If Endpoint is deleted, Service usually updates to empty endpoints or is deleted too.
-        if kind == ResourceKind::Endpoint {
-             let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
-             if let Some(svc) = self.get_service(&ep.metadata.namespace, &ep.metadata.name).await? {
-                 // Regenerate service rules with empty endpoint (Reject rules)
-                 let empty_ep = common::Endpoint {
-                     api_version: "v1".into(),
-                     kind: "Endpoints".into(),
-                     metadata: ep.metadata.clone(),
-                     subsets: vec![],
-                 };
-                 let update = common::NetworkUpdate {
-                    op: common::NetworkUpdateOp::Put,
-                    service: Some(svc),
-                    endpoint: Some(empty_ep),
-                    resource_version: Utc::now().to_rfc3339(),
-                };
-                 info!("Incremental update (Endpoint deleted) for Service {}", update.service.as_ref().unwrap().metadata.name);
-                 self.broadcast_update(update).await?;
-             }
+            let rules = generate_service_update(&svc, &empty_ep)?; // Reject rules
+            info!("Stored incremental empty-endpoints rules for Service {}", svc.metadata.name);
+
+            let update = NetworkUpdate {
+                op: NetworkUpdateOp::Put,
+                service: Some(svc),
+                endpoint: Some(empty_ep),
+                resource_version: "".to_string(),
+            };
+
+            self.store_incremental_rules(rules, update).await?;
         }
         Ok(())
     }
@@ -201,22 +162,17 @@ impl Controller for NftablesController {
     }
 
     async fn handle_watch_response(&mut self, response: &ResourceWatchResponse) -> Result<()> {
-        // Parse key to extract namespace and name
-        // Key format example: /registry/services/specs/default/my-service
-        let parts: Vec<&str> = response.key.split('/').collect();
-        if parts.len() < 2 {
-            warn!("Invalid key format: {}", response.key);
+        // We only watch Endpoints in this controller.
+        if response.kind != ResourceKind::Endpoint {
             return Ok(());
         }
-        let name = parts.last().unwrap();
-        let namespace = parts.get(parts.len() - 2).unwrap_or(&"default");
 
         match &response.event {
             WatchEvent::Add { yaml } | WatchEvent::Update { new_yaml: yaml, .. } => {
-                self.process_upsert(namespace, name, response.kind.clone(), yaml).await?;
+                self.process_upsert(yaml).await?;
             }
             WatchEvent::Delete { yaml } => {
-                self.process_delete(namespace, name, response.kind.clone(), yaml).await?;
+                self.process_delete(yaml).await?;
             }
         }
         Ok(())
