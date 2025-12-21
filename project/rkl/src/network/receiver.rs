@@ -11,9 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
-use nftables::{helper, schema};
 use tokio::task;
-use serde_json;
 
 /// Main network configuration receiver that coordinates subnet and route configuration
 /// This will be the primary interface for receiving network configurations from rks
@@ -255,14 +253,40 @@ impl NetworkReceiver {
         Ok(())
     }
 
-    /// Apply nftables rules payload (JSON) using `nftables` crate helper.
+    /// Apply nftables rules payload (JSON) using `nft` binary directly.
     pub async fn apply_nft_rules(&self, rules: String) -> Result<()> {
         info!("Applying nftables rules on node {} (len={})", self.node_id, rules.len());
 
+        // We cannot use nftables crate helper because our JSON contains features (verdict maps)
+        // that the crate's structs do not support deserializing.
+        // So we shell out to `nft -j -f -`.
+        
         let rules_clone = rules.clone();
         let _res = task::spawn_blocking(move || -> anyhow::Result<()> {
-            let nft: schema::Nftables = serde_json::from_str(&rules_clone)?;
-            helper::apply_ruleset(&nft)?;
+            use std::process::{Command, Stdio};
+            use std::io::Write;
+
+            // Try `nft -j -f -` first, if that fails (e.g. older nft), try `nft -f -`
+            // Modern nftables supports JSON input via -j or auto-detection.
+            let mut child = Command::new("nft")
+                .arg("-j")
+                .arg("-f")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(rules_clone.as_bytes())?;
+            }
+
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow::anyhow!("nft command failed: {}", stderr));
+            }
+            
             Ok(())
         })
         .await
