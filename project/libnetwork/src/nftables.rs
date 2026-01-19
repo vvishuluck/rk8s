@@ -108,60 +108,32 @@ pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[c
         ..Default::default()
     })));
 
-    // 7. Masquerade Rules
-    // Mark packets that need masquerade (0x4000)
-    // This part usually requires matching source/dest or marks.
-    // For simplicity, we just masquerade everything in `masquerade` chain if it was marked?
-    // The original code had:
-    // mark set mark or 0x4000
-    // masquerade
-    
-    // We will just add a simple masquerade rule for now, or replicate the logic if possible.
-    // Original code:
-    // mark_match_stmt (mark & 0x4000 != 0) -> masquerade
-    // hairpin rule (ct status & DNAT != 0) -> masquerade
-    
-    // Re-implementing Masquerade Rules using nftables structs
-    
-    // Rule 1: Masquerade if mark & 0x4000 != 0
+    // 7. Masquerade Rules (Granular policies)
+    // Scenario 1: Pod → ClusterIP → Other Pod (identified by mark 0x4000)
+    // When traffic is marked as 0x4000, it indicates Pod-to-Pod traffic via Service, requiring SNAT
     objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
         family: types::NfFamily::IP,
         table: Cow::Borrowed("rk8s"),
         chain: Cow::Borrowed("masquerade"),
         expr: Cow::Owned(vec![
+            // Match mark 0x4000 (Service traffic marker)
             stmt::Statement::Match(stmt::Match {
-                left: expr::Expression::BinaryOperation(Box::new(expr::BinaryOperation::AND(
-                    expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::Mark })),
-                    expr::Expression::Number(0x4000),
-                ))),
-                op: stmt::Operator::NEQ,
-                right: expr::Expression::Number(0),
+                left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { 
+                    key: expr::MetaKey::Mark 
+                })),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::Number(0x4000),
             }),
-            stmt::Statement::Masquerade(None)
+            // Action: Masquerade
+            stmt::Statement::Masquerade(None),
         ]),
-        comment: Some(Cow::Borrowed("rk8s-masquerade-marked")),
+        comment: Some(Cow::Borrowed("Pod → ClusterIP → Other Pod")),
         ..Default::default()
     })));
 
-    // Rule 2: Hairpin (ct status dnat)
-    objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
-        family: types::NfFamily::IP,
-        table: Cow::Borrowed("rk8s"),
-        chain: Cow::Borrowed("masquerade"),
-        expr: Cow::Owned(vec![
-            stmt::Statement::Match(stmt::Match {
-                left: expr::Expression::BinaryOperation(Box::new(expr::BinaryOperation::AND(
-                    expr::Expression::Named(expr::NamedExpression::CT(expr::CT { key: "status".into(), family: None, dir: None })),
-                    expr::Expression::Number(2), // DNAT bit
-                ))),
-                op: stmt::Operator::NEQ,
-                right: expr::Expression::Number(0),
-            }),
-            stmt::Statement::Masquerade(None)
-        ]),
-        comment: Some(Cow::Borrowed("rk8s-masquerade-hairpin")),
-        ..Default::default()
-    })));
+    // Scenario 2: Pod → Same Node Pod - No handling (no rules, direct routing)
+    // Scenario 3: Pod → Service → Self (Hairpin) - No handling (no rules, loopback)
+    // Note: These two scenarios don't require rules; traffic passes naturally without masquerade
 
     // 8. Generate Service Chains (Full Sync)
     let mut parsed_endpoints = std::collections::HashMap::new();
@@ -179,7 +151,8 @@ pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[c
                 subsets: vec![],
             });
         
-        let update_objects = generate_service_update_objects(svc, &ep)?;
+        // Full Sync: Do not include delete commands for dispatch rules, as table is flushed.
+        let update_objects = generate_service_update_objects(svc, &ep, true)?;
         objects.extend(update_objects);
     }
 
@@ -187,7 +160,7 @@ pub fn generate_nftables_config(services: &[common::ServiceTask], endpoints: &[c
     serde_json::to_string(&nftables).map_err(|e| anyhow::anyhow!(e))
 }
 
-fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpoint) -> Result<Vec<schema::NfObject<'static>>> {
+fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpoint, full_sync: bool) -> Result<Vec<schema::NfObject<'static>>> {
     let cluster_ip = match svc.spec.cluster_ip.as_deref() {
         Some(ip) if ip != "None" && !ip.is_empty() => ip,
         _ => return Ok(Vec::new()),
@@ -199,6 +172,34 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
         let protocol = svc_port.protocol.to_lowercase();
         let chain_name = format!("svc-{}-{}-{}", svc.metadata.namespace, svc.metadata.name, svc_port.port);
         let dispatch_chain = if protocol == "udp" { "services_udp" } else { "services_tcp" };
+
+        if !full_sync {
+            // Delete old dispatch rule for ClusterIP to avoid duplicates (Incremental only)
+            let delete_clusterip_rule = create_dispatch_rule(
+                dispatch_chain,
+                &protocol,
+                cluster_ip,
+                svc_port.port,
+                &chain_name,
+            );
+            objects.push(schema::NfObject::CmdObject(
+                schema::NfCmd::Delete(schema::NfListObject::Rule(delete_clusterip_rule))
+            ));
+
+            // Delete old dispatch rule for NodePort if exists (Incremental only)
+            if let Some(node_port) = svc_port.node_port {
+                let delete_nodeport_rule = create_dispatch_rule(
+                    dispatch_chain,
+                    &protocol,
+                    "0.0.0.0/0",
+                    node_port,
+                    &chain_name,
+                );
+                objects.push(schema::NfObject::CmdObject(
+                    schema::NfCmd::Delete(schema::NfListObject::Rule(delete_nodeport_rule))
+                ));
+            }
+        }
 
         // 1. Create Chain
         objects.push(schema::NfObject::ListObject(schema::NfListObject::Chain(schema::Chain {
@@ -217,15 +218,12 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
         }))));
 
         // 3. Add Dispatch Rule (in services_tcp/udp)
-        // Match daddr & dport -> jump to svc chain
-        // Also mark packet for masquerade if needed (0x4000) - usually done in svc chain if source is outside?
-        // For now, just jump.
+        // Mark ClusterIP traffic with 0x4000 for SNAT identification in postrouting
         objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
             family: types::NfFamily::IP,
             table: Cow::Borrowed("rk8s"),
             chain: Cow::Borrowed(dispatch_chain),
             expr: Cow::Owned(vec![
-                // ensure transport protocol is matched before accessing transport-layer payload
                 stmt::Statement::Match(stmt::Match {
                     left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::L4proto })),
                     op: stmt::Operator::EQ,
@@ -246,6 +244,11 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
                     }))),
                     op: stmt::Operator::EQ,
                     right: expr::Expression::Number(svc_port.port as u32),
+                }),
+                // Mark ClusterIP path for postrouting SNAT (NodePort path won't have this mark)
+                stmt::Statement::Mangle(stmt::Mangle {
+                    key: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::Mark })),
+                    value: expr::Expression::Number(0x4000),
                 }),
                 stmt::Statement::Jump(stmt::JumpTarget { target: Cow::Owned(chain_name.clone()) })
             ]),
@@ -289,7 +292,7 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
             let num_backends = backends.len() as u32;
             
             if num_backends > 1 {
-                // 1. Set Mark Rule: meta mark set (meta mark & 0xFFFF0000) | (numgen random mod N)
+                // 1. Set backend index for load balancing (temporarily overwrites 0x4000, will restore after selection)
                 objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
                     family: types::NfFamily::IP,
                     table: Cow::Borrowed("rk8s"),
@@ -304,31 +307,35 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
                             }))
                         })
                     ]),
-                    comment: Some(Cow::Borrowed("LB: set mark")),
+                    comment: Some(Cow::Borrowed("LB: set backend index")),
                     ..Default::default()
                 })));
 
-                // 2. Dispatch Rules
+                // 2. Dispatch to backends based on index (service mark already set by dispatch rule)
                 for (i, (ip, port)) in backends.iter().enumerate() {
                     objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
                         family: types::NfFamily::IP,
                         table: Cow::Borrowed("rk8s"),
                         chain: Cow::Owned(chain_name.clone()),
                         expr: Cow::Owned(vec![
-                            // Ensure l4proto is matched before DNAT with port (transport-layer mapping)
+                            // Ensure l4proto is matched before DNAT with port
                             stmt::Statement::Match(stmt::Match {
                                 left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::L4proto })),
                                 op: stmt::Operator::EQ,
                                 right: expr::Expression::String(Cow::Owned(protocol.clone())),
                             }),
+                            // Match backend index
                             stmt::Statement::Match(stmt::Match {
-                                left: expr::Expression::BinaryOperation(Box::new(expr::BinaryOperation::AND(
-                                    expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::Mark })),
-                                    expr::Expression::Number(0xFFFF)
-                                ))),
+                                left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::Mark })),
                                 op: stmt::Operator::EQ,
                                 right: expr::Expression::Number(i as u32),
                             }),
+                            // Restore service mark (0x4000) for masquerade identification in postrouting
+                            stmt::Statement::Mangle(stmt::Mangle {
+                                key: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::Mark })),
+                                value: expr::Expression::Number(0x4000),
+                            }),
+                            // Perform DNAT
                             stmt::Statement::DNAT(Some(stmt::NAT {
                                 addr: Some(expr::Expression::String(Cow::Owned(ip.clone()))),
                                 family: Some(stmt::NATFamily::IP),
@@ -340,7 +347,7 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
                     })));
                 }
             } else {
-                // Single backend
+                // Single backend (mark 0x4000 already set by ClusterIP dispatch rule, preserved for masquerade)
                 let (ip, port) = &backends[0];
                 objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(schema::Rule {
                     family: types::NfFamily::IP,
@@ -353,12 +360,13 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
                             op: stmt::Operator::EQ,
                             right: expr::Expression::String(Cow::Owned(protocol.clone())),
                         }),
+                        // Perform DNAT (mark already set by ClusterIP dispatch rule)
                         stmt::Statement::DNAT(Some(stmt::NAT {
                             addr: Some(expr::Expression::String(Cow::Owned(ip.clone()))),
                             family: Some(stmt::NATFamily::IP),
                             port: Some(expr::Expression::Number(*port as u32)),
                             flags: None,
-                        }))
+                            }))
                     ]),
                     ..Default::default()
                 })));
@@ -397,7 +405,7 @@ fn generate_service_update_objects(svc: &common::ServiceTask, ep: &common::Endpo
 }
 
 pub fn generate_service_update(svc: &common::ServiceTask, ep: &common::Endpoint) -> Result<String> {
-    let objects = generate_service_update_objects(svc, ep)?;
+    let objects = generate_service_update_objects(svc, ep, false)?;
     let nftables = schema::Nftables { objects: Cow::Owned(objects) };
     serde_json::to_string(&nftables).map_err(|e| anyhow::anyhow!(e))
 }
@@ -415,15 +423,12 @@ pub fn generate_service_delete(svc: &common::ServiceTask) -> Result<String> {
         let chain_name = format!("svc-{}-{}-{}", svc.metadata.namespace, svc.metadata.name, svc_port.port);
         let dispatch_chain = if protocol == "udp" { "services_udp" } else { "services_tcp" };
 
-        // 1. Delete Dispatch Rule
-        // We need to match the rule exactly to delete it.
-        // Rule: ip daddr <ip> <proto> dport <port> jump <chain>
+        // 1. Delete ClusterIP Dispatch Rule (must match exactly including mark statement)
         let rule = schema::Rule {
             family: types::NfFamily::IP,
             table: Cow::Borrowed("rk8s"),
             chain: Cow::Borrowed(dispatch_chain),
             expr: Cow::Owned(vec![
-                // same ordering as creation: first ensure l4proto then ip daddr and transport dport
                 stmt::Statement::Match(stmt::Match {
                     left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::L4proto })),
                     op: stmt::Operator::EQ,
@@ -444,6 +449,11 @@ pub fn generate_service_delete(svc: &common::ServiceTask) -> Result<String> {
                     }))),
                     op: stmt::Operator::EQ,
                     right: expr::Expression::Number(svc_port.port as u32),
+                }),
+                // Include mark statement to match creation rule exactly
+                stmt::Statement::Mangle(stmt::Mangle {
+                    key: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { key: expr::MetaKey::Mark })),
+                    value: expr::Expression::Number(0x4000),
                 }),
                 stmt::Statement::Jump(stmt::JumpTarget { target: Cow::Owned(chain_name.clone()) })
             ]),
@@ -596,6 +606,59 @@ mod tests {
                 println!("Skipping nft validation: nft command not found or failed to start: {}", e);
             }
         }
+    }
+}
+
+/// Helper function to create a dispatch rule for ClusterIP or NodePort
+/// Used for both adding and deleting rules in services_tcp/udp chains
+fn create_dispatch_rule<'a>(
+    chain: &'a str,
+    protocol: &str,
+    dst_ip: &str,
+    dst_port: i32,
+    target_chain: &str,
+) -> schema::Rule<'a> {
+    schema::Rule {
+        family: types::NfFamily::IP,
+        table: Cow::Borrowed("rk8s"),
+        chain: Cow::Borrowed(chain),
+        expr: Cow::Owned(vec![
+            // Match transport protocol
+            stmt::Statement::Match(stmt::Match {
+                left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta { 
+                    key: expr::MetaKey::L4proto 
+                })),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::String(Cow::Owned(protocol.to_string())),
+            }),
+            // Match destination IP
+            stmt::Statement::Match(stmt::Match {
+                left: expr::Expression::Named(expr::NamedExpression::Payload(
+                    expr::Payload::PayloadField(expr::PayloadField {
+                        protocol: Cow::Borrowed("ip"),
+                        field: Cow::Borrowed("daddr"),
+                    })
+                )),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::String(Cow::Owned(dst_ip.to_string())),
+            }),
+            // Match destination port
+            stmt::Statement::Match(stmt::Match {
+                left: expr::Expression::Named(expr::NamedExpression::Payload(
+                    expr::Payload::PayloadField(expr::PayloadField {
+                        protocol: Cow::Owned(protocol.to_string()),
+                        field: Cow::Borrowed("dport"),
+                    })
+                )),
+                op: stmt::Operator::EQ,
+                right: expr::Expression::Number(dst_port as u32),
+            }),
+            // Jump to service chain
+            stmt::Statement::Jump(stmt::JumpTarget { 
+                target: Cow::Owned(target_chain.to_string()) 
+            }),
+        ]),
+        ..Default::default()
     }
 }
 

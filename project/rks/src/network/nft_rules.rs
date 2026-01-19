@@ -4,11 +4,9 @@ use crate::controllers::manager::{Controller, ResourceWatchResponse, WatchEvent}
 use crate::node::NodeRegistry;
 use async_trait::async_trait;
 use common::{self, ResourceKind};
-use std::sync::Arc;
 use log::{info, warn};
-use chrono::Utc;
-use serde_json;
 use serde_yaml;
+use std::sync::Arc;
 
 
 /// NftablesController watches Services and Endpoints, generates nftables rules,
@@ -46,103 +44,55 @@ impl NftablesController {
             }
         }
 
-        let state = common::NetworkState {
-            services,
-            endpoints,
-            resource_version: Utc::now().to_rfc3339(),
-        };
+        // Generate JSON rules (Full Sync)
+        let json_rules = generate_nftables_config(&services, &endpoints)?;
 
-        self.broadcast_state(state).await
+        self.broadcast_rules(json_rules).await
     }
 
-    async fn broadcast_state(&self, state: common::NetworkState) -> Result<()> {
+    async fn broadcast_rules(&self, json_rules: String) -> Result<()> {
         let sessions = self.node_registry.list_sessions().await;
         if sessions.is_empty() {
+            info!("Broadcasting nftables rules skipped: no worker nodes connected");
             return Ok(());
         }
 
-        info!("Broadcasting network state (ver={}) to {} nodes", state.resource_version, sessions.len());
-        let msg = common::RksMessage::SetNetworkState(state);
+        info!("Broadcasting full nftables rules to {} nodes (len={})", 
+              sessions.len(), json_rules.len());
+        
+        let msg = common::RksMessage::SetNftablesRules(json_rules);
         
         for (node_id, session) in sessions {
             if let Err(e) = session.tx.try_send(msg.clone()) {
-                warn!("Failed to send state to node {}: {}", node_id, e);
+                warn!("Failed to send rules to node {}: {}", node_id, e);
             }
         }
         Ok(())
-    }
-
-    async fn broadcast_update(&self, update: common::NetworkUpdate) -> Result<()> {
-        let sessions = self.node_registry.list_sessions().await;
-        if sessions.is_empty() {
-            return Ok(());
-        }
-
-        info!("Broadcasting network update (op={:?}) to {} nodes", update.op, sessions.len());
-        let msg = common::RksMessage::UpdateNetworkState(update);
-        
-        for (node_id, session) in sessions {
-            if let Err(e) = session.tx.try_send(msg.clone()) {
-                warn!("Failed to send update to node {}: {}", node_id, e);
-            }
-        }
-        Ok(())
-    }
-
-    // Helper to fetch a specific service from the store (using snapshot for now)
-    async fn get_service(&self, ns: &str, name: &str) -> Result<Option<common::ServiceTask>> {
-        let svc_key = format!("specs/{}/{}", ns, name);
-        self.xline_store.get_service(&svc_key).await
     }
 
     // Only handle Endpoint upserts: Services are not watched to reduce noise.
     async fn process_upsert(&mut self, yaml: &str) -> Result<()> {
-        let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
-        // Service name is expected to match endpoint metadata (namespace + name)
-        let ns = &ep.metadata.namespace;
-        let name = &ep.metadata.name;
-        let svc = match self.get_service(ns, name).await? {
-            Some(s) => s,
-            None => return Ok(()), // Endpoint without Service is orphan, ignore
-        };
-
-        let rules = generate_service_update(&svc, &ep)?;
-        info!("Stored incremental rules for endpoint {}/{}", ns, name);
-
-        let update = common::NetworkUpdate {
-            op: common::NetworkUpdateOp::Put,
-            service: Some(svc),
-            endpoint: Some(ep),
-            resource_version: Utc::now().to_rfc3339(),
-        };
+        // Parse purely for logging context
+        if let Ok(ep) = serde_yaml::from_str::<common::Endpoint>(yaml) {
+             info!("NftablesController: processing endpoint upsert {}/{}, triggering full sync", 
+                  ep.metadata.namespace, ep.metadata.name);
+        } else {
+             info!("NftablesController: processing endpoint upsert (parse failed), triggering full sync");
+        }
         
-        info!("Incremental upsert for {}/{}", ns, name);
-        self.broadcast_update(update).await
+        self.sync_rules().await
     }
 
-    // Only handle Endpoint deletions: generate reject/cleanup rules when endpoints are removed.
+    // Only handle Endpoint deletions.
     async fn process_delete(&mut self, yaml: &str) -> Result<()> {
-        let ep: common::Endpoint = serde_yaml::from_str(yaml)?;
-        if let Some(svc) = self.get_service(&ep.metadata.namespace, &ep.metadata.name).await? {
-            let empty_ep = common::Endpoint {
-                api_version: "v1".into(),
-                kind: "Endpoints".into(),
-                metadata: ep.metadata.clone(),
-                subsets: vec![],
-            };
-            let rules = generate_service_update(&svc, &empty_ep)?; // Reject rules
-            info!("Stored incremental empty-endpoints rules for Service {}", svc.metadata.name);
-
-            let update = NetworkUpdate {
-                op: NetworkUpdateOp::Put,
-                service: Some(svc),
-                endpoint: Some(empty_ep),
-                resource_version: "".to_string(),
-            };
-
-            self.store_incremental_rules(rules, update).await?;
+        if let Ok(ep) = serde_yaml::from_str::<common::Endpoint>(yaml) {
+             info!("NftablesController: processing endpoint delete {}/{}, triggering full sync", 
+                  ep.metadata.namespace, ep.metadata.name);
+        } else {
+             info!("NftablesController: processing endpoint delete (parse failed), triggering full sync");
         }
-        Ok(())
+
+        self.sync_rules().await
     }
 }
 
@@ -167,6 +117,8 @@ impl Controller for NftablesController {
             return Ok(());
         }
 
+        info!("NftablesController: received watch event for Endpoint kind={:?}", response.event);
+        
         match &response.event {
             WatchEvent::Add { yaml } | WatchEvent::Update { new_yaml: yaml, .. } => {
                 self.process_upsert(yaml).await?;
@@ -204,7 +156,7 @@ pub async fn build_rules(xline_store: &XlineStore) -> Result<String> {
 }
 
 // Re-export generation functions from libnetwork for tests
-pub use libnetwork::nftables::{generate_nftables_config, generate_service_update, generate_service_delete};
+pub use libnetwork::nftables::generate_nftables_config;
 
 
 
