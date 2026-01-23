@@ -1,4 +1,4 @@
-use crate::network::nft_rules::build_rules;
+use crate::controllers::nftrules_controller::build_rules;
 use crate::node::{Shared, WorkerSession};
 use anyhow::Context;
 use common::lease::{Lease, LeaseAttrs};
@@ -100,11 +100,19 @@ impl<'a> NodeRegister<'a> {
             Ok(rules) => {
                 let msg = RksMessage::SetNftablesRules(rules);
                 if let Err(e) = msg_tx.try_send(msg) {
-                    log::warn!("Failed to send initial nftables rules to {}: {}", node_id, e);
+                    log::warn!(
+                        "Failed to send initial nftables rules to {}: {}",
+                        node_id,
+                        e
+                    );
                 }
             }
             Err(e) => {
-                log::error!("Failed to build initial nftables rules for {}: {}", node_id, e);
+                log::error!(
+                    "Failed to build initial nftables rules for {}: {}",
+                    node_id,
+                    e
+                );
             }
         }
 

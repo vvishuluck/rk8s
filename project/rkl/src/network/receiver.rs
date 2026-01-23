@@ -4,7 +4,7 @@ use anyhow::Result;
 use libcni::ip::route::Route;
 use libnetwork::{config::NetworkConfig, route::RouteManager};
 use log::{error, info, warn};
-use nftables::{schema, helper};
+use nftables::{helper, schema};
 use quinn::{ClientConfig, Endpoint};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -258,19 +258,22 @@ impl NetworkReceiver {
     pub async fn apply_nft_rules(&self, rules: String) -> Result<()> {
         Self::apply_nft_rules_static(&self.node_id, rules).await
     }
-    
+
     // Static helper to allow calling from attempt_rks_connection
     async fn apply_nft_rules_static(node_id: &str, rules: String) -> Result<()> {
-        info!("Applying nftables rules on node {} (len={})", node_id, rules.len());
-        
-        let nftables: schema::Nftables = serde_json::from_str(&rules)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize nftables JSON to crate schema: {}", e))?;
+        info!(
+            "Applying nftables rules on node {} (len={})",
+            node_id,
+            rules.len()
+        );
 
-        task::spawn_blocking(move || {
-            helper::apply_ruleset(&nftables)
-        })
-        .await?
-        .map_err(|e| anyhow::anyhow!("nftables::helper::apply_ruleset failed: {}", e))?;
+        let nftables: schema::Nftables = serde_json::from_str(&rules).map_err(|e| {
+            anyhow::anyhow!("Failed to deserialize nftables JSON to crate schema: {}", e)
+        })?;
+
+        task::spawn_blocking(move || helper::apply_ruleset(&nftables))
+            .await?
+            .map_err(|e| anyhow::anyhow!("nftables::helper::apply_ruleset failed: {}", e))?;
 
         Ok(())
     }

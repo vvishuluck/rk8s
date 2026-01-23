@@ -13,12 +13,12 @@ mod vault;
 use crate::controllers::endpoint_controller::EndpointController;
 use crate::controllers::garbage_collector::GarbageCollector;
 use crate::controllers::{
-    CONTROLLER_MANAGER, ControllerManager, DeploymentController, ReplicaSetController,
+    CONTROLLER_MANAGER, ControllerManager, DeploymentController, NftablesController,
+    ReplicaSetController,
 };
 use crate::dns::authority::{run_dns_server, setup_dns_nftable};
 use crate::network::init;
 use crate::network::manager::LocalManager;
-use crate::network::nft_rules::NftablesController;
 use crate::node::{NodeRegistry, RksNode, Shared};
 use crate::protocol::config::{Config, config_ref, load_config};
 use crate::{api::xlinestore::XlineStore, scheduler::Scheduler, vault::Vault};
