@@ -346,12 +346,19 @@ pub async fn run_once(
                                 }
                                 Err(e) => {
                                     error!("[worker] failed to apply nftables rules: {e}");
-                                    let _ = client.send_msg(&RksMessage::Error(format!("apply nftables failed: {e}"))).await;
+                                    let _ = client
+                                        .send_msg(&RksMessage::Error(format!(
+                                            "apply nftables failed: {e}"
+                                        )))
+                                        .await;
                                 }
                             }
                         }
                         Ok(RksMessage::UpdateNftablesRules(rules)) => {
-                            info!("[worker] received nftables rules update (len={})", rules.len());
+                            info!(
+                                "[worker] received nftables rules update (len={})",
+                                rules.len()
+                            );
                             match network_receiver.apply_nft_rules(rules).await {
                                 Ok(()) => {
                                     info!("[worker] nftables rules updated");
@@ -359,36 +366,56 @@ pub async fn run_once(
                                 }
                                 Err(e) => {
                                     error!("[worker] failed to update nftables rules: {e}");
-                                    let _ = client.send_msg(&RksMessage::Error(format!("update nftables failed: {e}"))).await;
+                                    let _ = client
+                                        .send_msg(&RksMessage::Error(format!(
+                                            "update nftables failed: {e}"
+                                        )))
+                                        .await;
                                 }
                             }
                         }
                         Ok(RksMessage::SetNetworkState(state)) => {
-                            info!("[worker] received full network state (ver={})", state.resource_version);
-                            match libnetwork::nftables::generate_nftables_config(&state.services, &state.endpoints) {
-                                Ok(rules) => {
-                                     match network_receiver.apply_nft_rules(rules).await {
-                                        Ok(()) => {
-                                            info!("[worker] network state applied");
-                                            let _ = client.send_msg(&RksMessage::Ack).await;
-                                        }
-                                        Err(e) => {
-                                            error!("[worker] failed to apply network state rules: {e}");
-                                            let _ = client.send_msg(&RksMessage::Error(format!("apply network state failed: {e}"))).await;
-                                        }
+                            info!(
+                                "[worker] received full network state (ver={})",
+                                state.resource_version
+                            );
+                            match libnetwork::nftables::generate_nftables_config(
+                                &state.services,
+                                &state.endpoints,
+                            ) {
+                                Ok(rules) => match network_receiver.apply_nft_rules(rules).await {
+                                    Ok(()) => {
+                                        info!("[worker] network state applied");
+                                        let _ = client.send_msg(&RksMessage::Ack).await;
                                     }
-                                }
+                                    Err(e) => {
+                                        error!("[worker] failed to apply network state rules: {e}");
+                                        let _ = client
+                                            .send_msg(&RksMessage::Error(format!(
+                                                "apply network state failed: {e}"
+                                            )))
+                                            .await;
+                                    }
+                                },
                                 Err(e) => {
                                     error!("[worker] failed to generate rules from state: {e}");
-                                    let _ = client.send_msg(&RksMessage::Error(format!("generate rules failed: {e}"))).await;
+                                    let _ = client
+                                        .send_msg(&RksMessage::Error(format!(
+                                            "generate rules failed: {e}"
+                                        )))
+                                        .await;
                                 }
                             }
                         }
                         Ok(RksMessage::UpdateNetworkState(update)) => {
-                            info!("[worker] received network update (ver={})", update.resource_version);
+                            info!(
+                                "[worker] received network update (ver={})",
+                                update.resource_version
+                            );
                             let res = match update.op {
                                 NetworkUpdateOp::Put => {
-                                    if let (Some(svc), Some(ep)) = (update.service, update.endpoint) {
+                                    if let (Some(svc), Some(ep)) = (update.service, update.endpoint)
+                                    {
                                         libnetwork::nftables::generate_service_update(&svc, &ep)
                                     } else {
                                         Err(anyhow::anyhow!("Missing service or endpoint for Put"))
@@ -404,21 +431,29 @@ pub async fn run_once(
                             };
 
                             match res {
-                                Ok(rules) => {
-                                     match network_receiver.apply_nft_rules(rules).await {
-                                        Ok(()) => {
-                                            info!("[worker] network update applied");
-                                            let _ = client.send_msg(&RksMessage::Ack).await;
-                                        }
-                                        Err(e) => {
-                                            error!("[worker] failed to apply network update rules: {e}");
-                                            let _ = client.send_msg(&RksMessage::Error(format!("apply network update failed: {e}"))).await;
-                                        }
+                                Ok(rules) => match network_receiver.apply_nft_rules(rules).await {
+                                    Ok(()) => {
+                                        info!("[worker] network update applied");
+                                        let _ = client.send_msg(&RksMessage::Ack).await;
                                     }
-                                }
+                                    Err(e) => {
+                                        error!(
+                                            "[worker] failed to apply network update rules: {e}"
+                                        );
+                                        let _ = client
+                                            .send_msg(&RksMessage::Error(format!(
+                                                "apply network update failed: {e}"
+                                            )))
+                                            .await;
+                                    }
+                                },
                                 Err(e) => {
                                     error!("[worker] failed to generate rules from update: {e}");
-                                    let _ = client.send_msg(&RksMessage::Error(format!("generate update rules failed: {e}"))).await;
+                                    let _ = client
+                                        .send_msg(&RksMessage::Error(format!(
+                                            "generate update rules failed: {e}"
+                                        )))
+                                        .await;
                                 }
                             }
                         }

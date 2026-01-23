@@ -1,16 +1,14 @@
-use anyhow::Result;
 use crate::api::xlinestore::XlineStore;
 use crate::controllers::manager::{Controller, ResourceWatchResponse, WatchEvent};
 use crate::node::NodeRegistry;
+use anyhow::Result;
 use async_trait::async_trait;
 use common::{self, ResourceKind};
 use log::{info, warn};
 use serde_yaml;
 use std::sync::Arc;
 
-
-/// NftablesController watches Services and Endpoints, generates nftables rules,
-/// and broadcasts them to all registered worker nodes.
+/// Watches Services and Endpoints, generates nftables rules, and broadcasts to workers.
 pub struct NftablesController {
     xline_store: Arc<XlineStore>,
     node_registry: Arc<NodeRegistry>,
@@ -57,11 +55,14 @@ impl NftablesController {
             return Ok(());
         }
 
-        info!("Broadcasting full nftables rules to {} nodes (len={})", 
-              sessions.len(), json_rules.len());
-        
+        info!(
+            "Broadcasting full nftables rules to {} nodes (len={})",
+            sessions.len(),
+            json_rules.len()
+        );
+
         let msg = common::RksMessage::SetNftablesRules(json_rules);
-        
+
         for (node_id, session) in sessions {
             if let Err(e) = session.tx.try_send(msg.clone()) {
                 warn!("Failed to send rules to node {}: {}", node_id, e);
@@ -74,22 +75,30 @@ impl NftablesController {
     async fn process_upsert(&mut self, yaml: &str) -> Result<()> {
         // Parse purely for logging context
         if let Ok(ep) = serde_yaml::from_str::<common::Endpoint>(yaml) {
-             info!("NftablesController: processing endpoint upsert {}/{}, triggering full sync", 
-                  ep.metadata.namespace, ep.metadata.name);
+            info!(
+                "NftablesController: processing endpoint upsert {}/{}, triggering full sync",
+                ep.metadata.namespace, ep.metadata.name
+            );
         } else {
-             info!("NftablesController: processing endpoint upsert (parse failed), triggering full sync");
+            info!(
+                "NftablesController: processing endpoint upsert (parse failed), triggering full sync"
+            );
         }
-        
+
         self.sync_rules().await
     }
 
     // Only handle Endpoint deletions.
     async fn process_delete(&mut self, yaml: &str) -> Result<()> {
         if let Ok(ep) = serde_yaml::from_str::<common::Endpoint>(yaml) {
-             info!("NftablesController: processing endpoint delete {}/{}, triggering full sync", 
-                  ep.metadata.namespace, ep.metadata.name);
+            info!(
+                "NftablesController: processing endpoint delete {}/{}, triggering full sync",
+                ep.metadata.namespace, ep.metadata.name
+            );
         } else {
-             info!("NftablesController: processing endpoint delete (parse failed), triggering full sync");
+            info!(
+                "NftablesController: processing endpoint delete (parse failed), triggering full sync"
+            );
         }
 
         self.sync_rules().await
@@ -117,8 +126,11 @@ impl Controller for NftablesController {
             return Ok(());
         }
 
-        info!("NftablesController: received watch event for Endpoint kind={:?}", response.event);
-        
+        info!(
+            "NftablesController: received watch event for Endpoint kind={:?}",
+            response.event
+        );
+
         match &response.event {
             WatchEvent::Add { yaml } | WatchEvent::Update { new_yaml: yaml, .. } => {
                 self.process_upsert(yaml).await?;
@@ -157,7 +169,3 @@ pub async fn build_rules(xline_store: &XlineStore) -> Result<String> {
 
 // Re-export generation functions from libnetwork for tests
 pub use libnetwork::nftables::generate_nftables_config;
-
-
-
-
