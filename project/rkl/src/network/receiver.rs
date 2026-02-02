@@ -7,6 +7,7 @@ use log::{error, info, warn};
 use nftables::{helper, schema};
 use quinn::{ClientConfig, Endpoint};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;

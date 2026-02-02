@@ -6,12 +6,16 @@ use async_trait::async_trait;
 use common::{self, ResourceKind};
 use log::{info, warn};
 use serde_yaml;
+use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
 
 /// Watches Services and Endpoints, generates nftables rules, and broadcasts to workers.
 pub struct NftablesController {
     xline_store: Arc<XlineStore>,
     node_registry: Arc<NodeRegistry>,
+    out_of_sync: Arc<Mutex<HashSet<String>>>,
 }
 
 impl NftablesController {
@@ -19,6 +23,7 @@ impl NftablesController {
         Self {
             xline_store,
             node_registry,
+            out_of_sync: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -63,12 +68,100 @@ impl NftablesController {
 
         let msg = common::RksMessage::SetNftablesRules(json_rules);
 
+        let mut failed_nodes = Vec::new();
+
         for (node_id, session) in sessions {
             if let Err(e) = session.tx.try_send(msg.clone()) {
                 warn!("Failed to send rules to node {}: {}", node_id, e);
+                failed_nodes.push(node_id);
             }
         }
+
+        if !failed_nodes.is_empty() {
+            self.record_out_of_sync(&failed_nodes).await;
+            self.retry_broadcast(msg).await;
+        }
         Ok(())
+    }
+
+    async fn record_out_of_sync(&self, nodes: &[String]) {
+        let mut set = self.out_of_sync.lock().await;
+        for n in nodes {
+            set.insert(n.clone());
+        }
+    }
+
+    async fn retry_broadcast(&self, msg: common::RksMessage) {
+        const MAX_ATTEMPTS: usize = 3;
+        const BACKOFF_MS: u64 = 300;
+
+        let registry = self.node_registry.clone();
+        let tracker = self.out_of_sync.clone();
+
+        tokio::spawn(async move {
+            for attempt in 1..=MAX_ATTEMPTS {
+                // simple linear backoff
+                sleep(Duration::from_millis(BACKOFF_MS * attempt as u64)).await;
+
+                let nodes: Vec<String> = {
+                    let set = tracker.lock().await;
+                    set.iter().cloned().collect()
+                };
+
+                if nodes.is_empty() {
+                    return;
+                }
+
+                let mut successes = Vec::new();
+                for node_id in nodes {
+                    match registry.get(&node_id).await {
+                        Some(session) => {
+                            if let Err(e) = session.tx.try_send(msg.clone()) {
+                                warn!(
+                                    "Retry {}/{} failed to send rules to node {}: {}",
+                                    attempt, MAX_ATTEMPTS, node_id, e
+                                );
+                            } else {
+                                info!(
+                                    "Retry {}/{} succeeded sending rules to node {}",
+                                    attempt, MAX_ATTEMPTS, node_id
+                                );
+                                successes.push(node_id);
+                            }
+                        }
+                        None => {
+                            warn!(
+                                "Retry {}/{}: no active session for node {}",
+                                attempt, MAX_ATTEMPTS, node_id
+                            );
+                        }
+                    }
+                }
+
+                if !successes.is_empty() {
+                    let mut set = tracker.lock().await;
+                    for n in successes {
+                        set.remove(&n);
+                    }
+                }
+
+                // If all cleared, stop early
+                if tracker.lock().await.is_empty() {
+                    return;
+                }
+            }
+
+            let remaining: Vec<String> = {
+                let set = tracker.lock().await;
+                set.iter().cloned().collect()
+            };
+            if !remaining.is_empty() {
+                warn!(
+                    "Exhausted retries for nodes: {:?}; they remain out-of-sync until next full sync",
+                    remaining
+                );
+            }
+        });
     }
 
     // Only handle Endpoint upserts: Services are not watched to reduce noise.
@@ -117,7 +210,7 @@ impl Controller for NftablesController {
     }
 
     fn watch_resources(&self) -> Vec<ResourceKind> {
-        vec![ResourceKind::Service, ResourceKind::Endpoint]
+        vec![ResourceKind::Endpoint]
     }
 
     async fn handle_watch_response(&mut self, response: &ResourceWatchResponse) -> Result<()> {

@@ -695,11 +695,6 @@ pub enum RksMessage {
     /// Update nftables rules payload (serialized nft commands) - Incremental
     UpdateNftablesRules(String),
 
-    /// Set full network state (Services + Endpoints) - Full Sync
-    SetNetworkState(NetworkState),
-    /// Update network state (Single Service/Endpoint change) - Incremental
-    UpdateNetworkState(Box<NetworkUpdate>),
-
     //response
     Ack,
     Error(String),
@@ -779,16 +774,6 @@ impl std::fmt::Debug for RksMessage {
             Self::UpdateNftablesRules(rules) => {
                 write!(f, "RksMessage::UpdateNftablesRules (len={})", rules.len())
             }
-            Self::SetNetworkState(state) => write!(
-                f,
-                "RksMessage::SetNetworkState (ver={})",
-                state.resource_version
-            ),
-            Self::UpdateNetworkState(update) => write!(
-                f,
-                "RksMessage::UpdateNetworkState (op={:?}, ver={})",
-                update.op, update.resource_version
-            ),
             // response
             Self::Ack => f.write_str("RksMessage::Ack"),
             Self::Error(err_msg) => write!(f, "RksMessage::Error({})", err_msg),
@@ -874,14 +859,6 @@ impl Display for RksMessage {
             Self::UpdateNftablesRules(rules) => {
                 write!(f, "UpdateNftablesRules (len={})", rules.len())
             }
-            Self::SetNetworkState(state) => {
-                write!(f, "SetNetworkState (ver={})", state.resource_version)
-            }
-            Self::UpdateNetworkState(update) => write!(
-                f,
-                "UpdateNetworkState (op={:?}, ver={})",
-                update.op, update.resource_version
-            ),
             Self::Heartbeat { node_name, status } => {
                 let ready_state = status
                     .conditions
@@ -1543,25 +1520,4 @@ pub struct Deployment {
     pub spec: DeploymentSpec,
     #[serde(default)]
     pub status: DeploymentStatus,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct NetworkState {
-    pub services: Vec<ServiceTask>,
-    pub endpoints: Vec<Endpoint>,
-    pub resource_version: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub enum NetworkUpdateOp {
-    Put,
-    Delete,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct NetworkUpdate {
-    pub op: NetworkUpdateOp,
-    pub service: Option<ServiceTask>,
-    pub endpoint: Option<Endpoint>,
-    pub resource_version: String,
 }

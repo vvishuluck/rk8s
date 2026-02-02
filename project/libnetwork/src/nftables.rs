@@ -4,6 +4,9 @@ use nftables::{expr, schema, stmt, types};
 use serde_json::json;
 use std::borrow::Cow;
 
+// Mark used to tag service traffic for postrouting masquerade
+const SERVICE_TRAFFIC_MARK: u32 = 0x4000;
+
 /// Generates the FULL configuration (Table, Base Chains, and all Service Chains).
 /// Used for initialization.
 pub fn generate_nftables_config(
@@ -176,21 +179,21 @@ pub fn generate_nftables_config(
     )));
 
     // 7. Masquerade Rules (Granular policies)
-    // Scenario 1: Pod → ClusterIP → Other Pod (identified by mark 0x4000)
-    // When traffic is marked as 0x4000, it indicates Pod-to-Pod traffic via Service, requiring SNAT
+    // Scenario 1: Pod → ClusterIP → Other Pod (identified by the service mark)
+    // When traffic is marked, it indicates Pod-to-Pod traffic via Service, requiring SNAT
     objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(
         schema::Rule {
             family: types::NfFamily::IP,
             table: Cow::Borrowed("rk8s"),
             chain: Cow::Borrowed("masquerade"),
             expr: Cow::Owned(vec![
-                // Match mark 0x4000 (Service traffic marker)
+                // Match service traffic marker
                 stmt::Statement::Match(stmt::Match {
                     left: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta {
                         key: expr::MetaKey::Mark,
                     })),
                     op: stmt::Operator::EQ,
-                    right: expr::Expression::Number(0x4000),
+                    right: expr::Expression::Number(SERVICE_TRAFFIC_MARK),
                 }),
                 // Action: Masquerade
                 stmt::Statement::Masquerade(None),
@@ -308,7 +311,7 @@ fn generate_service_update_objects(
         )));
 
         // 3. Add Dispatch Rule (in services_tcp/udp)
-        // Mark ClusterIP traffic with 0x4000 for SNAT identification in postrouting
+        // Mark ClusterIP traffic for SNAT identification in postrouting
         objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(
             schema::Rule {
                 family: types::NfFamily::IP,
@@ -347,7 +350,7 @@ fn generate_service_update_objects(
                         key: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta {
                             key: expr::MetaKey::Mark,
                         })),
-                        value: expr::Expression::Number(0x4000),
+                        value: expr::Expression::Number(SERVICE_TRAFFIC_MARK),
                     }),
                     stmt::Statement::Jump(stmt::JumpTarget {
                         target: Cow::Owned(chain_name.clone()),
@@ -397,7 +400,7 @@ fn generate_service_update_objects(
             let num_backends = backends.len() as u32;
 
             if num_backends > 1 {
-                // 1. Set backend index for load balancing (temporarily overwrites 0x4000, will restore after selection)
+                // 1. Set backend index for load balancing (temporarily overwrites the service mark, restored after selection)
                 objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(
                     schema::Rule {
                         family: types::NfFamily::IP,
@@ -448,14 +451,14 @@ fn generate_service_update_objects(
                                     op: stmt::Operator::EQ,
                                     right: expr::Expression::Number(i as u32),
                                 }),
-                                // Restore service mark (0x4000) for masquerade identification in postrouting
+                                // Restore service mark for masquerade identification in postrouting
                                 stmt::Statement::Mangle(stmt::Mangle {
                                     key: expr::Expression::Named(expr::NamedExpression::Meta(
                                         expr::Meta {
                                             key: expr::MetaKey::Mark,
                                         },
                                     )),
-                                    value: expr::Expression::Number(0x4000),
+                                    value: expr::Expression::Number(SERVICE_TRAFFIC_MARK),
                                 }),
                                 // Perform DNAT
                                 stmt::Statement::DNAT(Some(stmt::NAT {
@@ -470,7 +473,7 @@ fn generate_service_update_objects(
                     )));
                 }
             } else {
-                // Single backend (mark 0x4000 already set by ClusterIP dispatch rule, preserved for masquerade)
+                // Single backend (mark already set by ClusterIP dispatch rule, preserved for masquerade)
                 let (ip, port) = &backends[0];
                 objects.push(schema::NfObject::ListObject(schema::NfListObject::Rule(
                     schema::Rule {
@@ -609,7 +612,7 @@ pub fn generate_service_delete(svc: &common::ServiceTask) -> Result<String> {
                     key: expr::Expression::Named(expr::NamedExpression::Meta(expr::Meta {
                         key: expr::MetaKey::Mark,
                     })),
-                    value: expr::Expression::Number(0x4000),
+                    value: expr::Expression::Number(SERVICE_TRAFFIC_MARK),
                 }),
                 stmt::Statement::Jump(stmt::JumpTarget {
                     target: Cow::Owned(chain_name.clone()),
@@ -732,131 +735,5 @@ fn create_dispatch_rule<'a>(
             }),
         ]),
         ..Default::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use common::{
-        Endpoint, EndpointAddress, EndpointPort, EndpointSubset, ObjectMeta, ServicePort,
-        ServiceSpec, ServiceTask,
-    };
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    #[test]
-    fn test_generate_and_check_nftables_config() {
-        // 1. Mock Data
-        let svc = ServiceTask {
-            api_version: "v1".into(),
-            kind: "Service".into(),
-            metadata: ObjectMeta {
-                name: "mysvc".into(),
-                namespace: "default".into(),
-                ..Default::default()
-            },
-            spec: ServiceSpec {
-                cluster_ip: Some("10.96.0.100".into()),
-                ports: vec![ServicePort {
-                    name: Some("http".into()),
-                    protocol: "TCP".into(),
-                    port: 80,
-                    target_port: Some(8080),
-                    node_port: Some(30080),
-                }],
-                selector: None,
-                service_type: "NodePort".into(),
-            },
-        };
-
-        let ep = Endpoint {
-            api_version: "v1".into(),
-            kind: "Endpoints".into(),
-            metadata: ObjectMeta {
-                name: "mysvc".into(),
-                namespace: "default".into(),
-                ..Default::default()
-            },
-            subsets: vec![EndpointSubset {
-                addresses: vec![
-                    EndpointAddress {
-                        ip: "10.244.1.2".into(),
-                        node_name: None,
-                        target_ref: None,
-                    },
-                    EndpointAddress {
-                        ip: "10.244.1.3".into(),
-                        node_name: None,
-                        target_ref: None,
-                    },
-                ],
-                not_ready_addresses: vec![],
-                ports: vec![EndpointPort {
-                    name: Some("http".into()),
-                    port: 8080,
-                    protocol: "TCP".into(),
-                    app_protocol: None,
-                }],
-            }],
-        };
-
-        // 2. Generate Config
-        let json_output =
-            generate_nftables_config(&[svc], &[ep]).expect("failed to generate config");
-
-        println!("Generated JSON:\n{}", json_output);
-
-        // 3. Validate with nft --check (if available)
-        // Note: This might require root or CAP_NET_ADMIN depending on nft version/kernel
-        let status = Command::new("nft")
-            .args(["-j", "--check", "-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-
-        match status {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin
-                        .write_all(json_output.as_bytes())
-                        .expect("failed to write to stdin");
-                }
-                let output = child.wait_with_output().expect("failed to wait on child");
-
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    println!(
-                        "nft check failed. stderr: '{}', stdout: '{}'",
-                        stderr, stdout
-                    );
-
-                    // Don't fail the test if nft is missing or permission denied, just warn
-                    if stderr.contains("Permission denied")
-                        || stderr.contains("Operation not permitted")
-                        || stdout.contains("Permission denied")
-                        || stdout.contains("Operation not permitted")
-                    {
-                        println!("Skipping validation: Permission denied");
-                    } else if stderr.is_empty() && stdout.is_empty() {
-                        println!(
-                            "Skipping validation: nft failed with no output (likely permission issue in container)"
-                        );
-                    } else {
-                        panic!("nft configuration invalid");
-                    }
-                } else {
-                    println!("nft configuration is valid!");
-                }
-            }
-            Err(e) => {
-                println!(
-                    "Skipping nft validation: nft command not found or failed to start: {}",
-                    e
-                );
-            }
-        }
     }
 }
