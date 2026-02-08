@@ -12,6 +12,7 @@ use crate::meta::store::{
     StatFsSnapshot,
 };
 use crate::meta::stores::{CacheInvalidationEvent, EtcdMetaStore, EtcdWatchWorker, WatchConfig};
+use crate::posix::NAME_MAX;
 use crate::vfs::fs::FileType;
 use crate::vfs::handles::DirHandle;
 use async_trait::async_trait;
@@ -206,32 +207,28 @@ impl<T: MetaStore + 'static> MetaClient<T> {
 
         // Detect if this is an etcd backend and start Watch Worker
         let watch_worker = if options.no_background_jobs {
+            debug!("Watch Worker disabled: no_background_jobs=true");
             None
         } else if let Some(etcd_store) = store.as_any().downcast_ref::<EtcdMetaStore>() {
             let client = etcd_store.get_client();
+            let config = WatchConfig::from_env_or_default();
 
-            // Create Watch Worker configuration
-            // Watch all metadata keys
-            // TODO: Consider watching only specific prefixes?
-            // For now, watch everything for simplicity
-            let config = WatchConfig {
-                key_prefix: "".to_string(),
-                event_buffer_size: 1000,
-                debug: false,
-            };
-
-            let (mut worker, invalidation_rx) = EtcdWatchWorker::new(client, config);
-
-            if let Err(e) = worker.start() {
-                warn!("Failed to start Watch Worker: {}", e);
+            if !config.enabled {
+                debug!("Watch Worker disabled: SLAYERFS_WATCH_ENABLED=false or default");
                 None
             } else {
-                debug!("Watch Worker started for etcd backend");
+                let (mut worker, invalidation_rx) = EtcdWatchWorker::new(client, config);
 
-                // Start the invalidation handler after creating MetaClient
-                let worker_arc = Arc::new(worker);
-                let rx = Arc::new(Mutex::new(invalidation_rx));
-                Some((worker_arc, rx))
+                if let Err(e) = worker.start() {
+                    warn!("Failed to start Watch Worker: {}", e);
+                    None
+                } else {
+                    debug!("Watch Worker started for etcd backend");
+
+                    let worker_arc = Arc::new(worker);
+                    let rx = Arc::new(Mutex::new(invalidation_rx));
+                    Some((worker_arc, rx))
+                }
             }
         } else {
             None
@@ -685,6 +682,13 @@ impl<T: MetaStore + 'static> MetaClient<T> {
             let mut symlink_encountered = false;
 
             for (idx, seg) in segments.iter().enumerate() {
+                // POSIX: check parent is a directory before lookup
+                if let Ok(Some(attr)) = self.cached_stat(current_ino).await
+                    && attr.kind != FileType::Dir
+                {
+                    return Err(MetaError::NotDirectory(current_ino));
+                }
+
                 let child_ino = self
                     .cached_lookup(current_ino, seg)
                     .await?
@@ -1114,6 +1118,14 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError> {
         self.ensure_writable()?;
         let parent = self.check_root(parent);
+
+        if name.is_empty() || name.len() > NAME_MAX {
+            return Err(MetaError::InvalidFilename);
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(MetaError::InvalidFilename);
+        }
+
         info!("MetaClient: mkdir operation for ({}, '{}')", parent, name);
 
         let ino = self.store.mkdir(parent, name.clone()).await?;
@@ -1189,6 +1201,14 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         self.ensure_writable()?;
         let inode = self.check_root(ino);
         let parent = self.check_root(parent);
+
+        if name.is_empty() || name.len() > NAME_MAX {
+            return Err(MetaError::InvalidFilename);
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(MetaError::InvalidFilename);
+        }
+
         info!(
             "MetaClient: link operation for inode {} into ({}, '{}')",
             inode, parent, name
@@ -1221,6 +1241,19 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     ) -> Result<(i64, FileAttr), MetaError> {
         self.ensure_writable()?;
         let parent = self.check_root(parent);
+
+        if name.is_empty() || name.len() > NAME_MAX {
+            return Err(MetaError::InvalidFilename);
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(MetaError::InvalidFilename);
+        }
+
+        // POSIX: symlink target path component must also respect NAME_MAX
+        if target.len() > NAME_MAX {
+            return Err(MetaError::InvalidFilename);
+        }
+
         info!(
             "MetaClient: symlink operation for ({}, '{}') -> '{}'",
             parent, name, target
@@ -1250,6 +1283,15 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
     #[tracing::instrument(level = "trace", skip(self), fields(parent, name))]
     async fn unlink(&self, parent: i64, name: &str) -> Result<(), MetaError> {
         self.ensure_writable()?;
+
+        // Validate filename length BEFORE lookup to return ENAMETOOLONG instead of ENOENT
+        if name.is_empty() || name.len() > NAME_MAX {
+            return Err(MetaError::InvalidFilename);
+        }
+        if name.contains('/') || name.contains('\0') {
+            return Err(MetaError::InvalidFilename);
+        }
+
         let parent = self.check_root(parent);
         info!("MetaClient: unlink operation for ({}, '{}')", parent, name);
 
@@ -1308,7 +1350,7 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         }
 
         // Validate name constraints
-        if new_name.is_empty() || new_name.len() > 255 {
+        if new_name.is_empty() || new_name.len() > NAME_MAX {
             return Err(MetaError::InvalidFilename);
         }
 
@@ -1516,7 +1558,7 @@ impl<T: MetaStore + 'static> MetaLayer for MetaClient<T> {
         }
 
         // Validate name constraints
-        if new_name.is_empty() || new_name.len() > 255 {
+        if new_name.is_empty() || new_name.len() > NAME_MAX {
             return Err(MetaError::InvalidFilename);
         }
 
