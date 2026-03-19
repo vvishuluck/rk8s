@@ -208,8 +208,12 @@ pub fn validate_network_config(cfg: &mut NetworkConfig) -> Result<()> {
             if cfg.service_subnet_len > 30 {
                 anyhow::bail!("ServiceSubnetLen must be less than /31");
             }
-            if cfg.service_subnet_len < prefix + 2 {
-                anyhow::bail!("ServiceCIDR must be able to accommodate at least four subnets");
+            if cfg.service_subnet_len < prefix {
+                anyhow::bail!(
+                    "ServiceSubnetLen (/{}) cannot be broader than ServiceCIDR prefix (/{})",
+                    cfg.service_subnet_len,
+                    prefix
+                );
             }
         } else {
             // Default to /24 per service

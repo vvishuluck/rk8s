@@ -577,6 +577,14 @@ pub async fn validate_and_allocate_cluster_ip(
                 ));
             }
 
+            if is_reserved_service_ip(ip, service_cidr) {
+                return Err(anyhow!(
+                    "cluster_ip {} is a reserved address in Service CIDR ({})",
+                    ip,
+                    service_cidr
+                ));
+            }
+
             // If already allocated, allow only when owned by the same service.
             if let Some(record) = registry.get_record(ip).await? {
                 if record.service_namespace == service_namespace

@@ -409,16 +409,6 @@ pub async fn dispatch_user(
                 return Ok(());
             }
 
-            if xline_store
-                .get_service_yaml(&svc.metadata.name)
-                .await?
-                .is_some()
-            {
-                let err_msg = format!("service \"{}\" already exists", svc.metadata.name);
-                conn.send_msg(&RksMessage::Error(err_msg)).await?;
-                return Ok(());
-            }
-
             // Auto-allocate ClusterIP if allocator is available
             if let Some(ref allocator) = shared.service_ip_allocator
                 && let Err(e) = validate_and_allocate_cluster_ip(
@@ -449,7 +439,50 @@ pub async fn dispatch_user(
                 svc.metadata.creation_timestamp = Some(Utc::now());
             }
             let yaml = serde_yaml::to_string(&*svc)?;
-            xline_store.insert_service_yaml(&name, &yaml).await?;
+            let created = xline_store
+                .insert_service_yaml_if_absent(&name, &yaml)
+                .await?;
+            if !created {
+                // Concurrent create won the CAS; rollback reservation from this request.
+                if let Some(ref allocator) = shared.service_ip_allocator {
+                    let should_release = match xline_store.get_service_yaml(&name).await {
+                        Ok(Some(existing_yaml)) => {
+                            if let Ok(existing_svc) =
+                                serde_yaml::from_str::<ServiceTask>(&existing_yaml)
+                            {
+                                existing_svc.spec.cluster_ip != svc.spec.cluster_ip
+                            } else {
+                                true
+                            }
+                        }
+                        Ok(None) => true,
+                        Err(_) => true,
+                    };
+
+                    if should_release
+                        && let Err(e) = crate::network::service_ip::deallocate_cluster_ip(
+                            &name,
+                            &svc.spec,
+                            allocator.as_ref(),
+                        )
+                        .await
+                    {
+                        warn!(
+                            target: "rks::node::user_dispatch",
+                            "Failed to rollback reserved ClusterIP for concurrent create on Service {}: {}",
+                            name,
+                            e
+                        );
+                    }
+                }
+
+                conn.send_msg(&RksMessage::Error(format!(
+                    "service \"{}\" already exists",
+                    name
+                )))
+                .await?;
+                return Ok(());
+            }
             info!(
                 target: "rks::node::user_dispatch",
                 "created Service {} with ClusterIP {:?}",
