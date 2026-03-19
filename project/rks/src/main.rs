@@ -26,12 +26,12 @@ use crate::{api::xlinestore::XlineStore, scheduler::Scheduler, vault::Vault};
 use anyhow::Context;
 use clap::Parser;
 use cli::{Cli, Commands};
+use ipnetwork::Ipv4Network;
 use libscheduler::plugins::{Plugins, node_resources_fit::ScoringStrategy};
 use libvault::storage::xline::XlineOptions;
 use log::{LevelFilter, error, info};
-use ipnetwork::Ipv4Network;
-use std::collections::{HashMap, HashSet};
 use rustls::crypto::CryptoProvider;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -322,7 +322,10 @@ async fn rebuild_service_ip_registry_from_services(
             None => {}
         }
 
-        if let Err(e) = registry.allocate(ip, owner.0.clone(), owner.1.clone()).await {
+        if let Err(e) = registry
+            .allocate(ip, owner.0.clone(), owner.1.clone())
+            .await
+        {
             error!(
                 target: "rks::main",
                 "failed to rebuild service-ip record {} for {}/{}: {}",
