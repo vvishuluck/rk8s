@@ -19,6 +19,7 @@ use crate::controllers::{
 use crate::dns::authority::{run_dns_server, setup_dns_nftable};
 use crate::network::init;
 use crate::network::manager::LocalManager;
+use crate::network::service_ip::{ServiceIpAllocator, ServiceIpRegistry};
 use crate::node::{NodeRegistry, RksNode, Shared};
 use crate::protocol::config::{Config, config_ref, load_config};
 use crate::{api::xlinestore::XlineStore, scheduler::Scheduler, vault::Vault};
@@ -65,9 +66,13 @@ async fn handle_start_command() -> anyhow::Result<()> {
     info!(target: "rks::main", "listening on {}", cfg.addr);
 
     let local_manager = init_local_manager(cfg, &xline_options).await?;
-    launch_scheduler(xline_options, xline_store.clone()).await?;
+    launch_scheduler(xline_options.clone(), xline_store.clone()).await?;
 
     let node_registry = Arc::new(NodeRegistry::default());
+
+    // Get network config and initialize Service IP allocator
+    let (network_config, service_ip_allocator) =
+        init_service_ip_components(cfg, &local_manager, &xline_options).await?;
 
     register_controllers(
         CONTROLLER_MANAGER.clone(),
@@ -86,6 +91,8 @@ async fn handle_start_command() -> anyhow::Result<()> {
         local_manager,
         vault.clone(),
         node_registry,
+        network_config,
+        service_ip_allocator,
     ));
 
     internal::start_internal_server(vault.clone()).await?;
@@ -157,6 +164,62 @@ async fn init_local_manager(
         })
         .context("new_subnet_manager failed")?;
     Ok(Arc::new(manager))
+}
+
+async fn init_service_ip_components(
+    cfg: &Config,
+    local_manager: &Arc<LocalManager>,
+    xline_options: &XlineOptions,
+) -> anyhow::Result<(
+    Arc<libnetwork::config::NetworkConfig>,
+    Option<Arc<ServiceIpAllocator>>,
+)> {
+    let network_config = Arc::new(local_manager.get_network_config().await?);
+
+    let service_ip_allocator = if let Some(service_cidr) = network_config.service_cidr {
+        let registry = Arc::new(
+            ServiceIpRegistry::new(cfg.xline_config.clone(), xline_options.clone()).await?,
+        );
+
+        match registry.list_all().await {
+            Ok(records) => {
+                info!(
+                    target: "rks::main",
+                    "Service IP registry loaded: {} existing allocations",
+                    records.len()
+                );
+            }
+            Err(e) => {
+                error!(
+                    target: "rks::main",
+                    "failed to list existing Service IP allocations: {}",
+                    e
+                );
+            }
+        }
+
+        let allocator = ServiceIpAllocator::new(
+            service_cidr,
+            registry,
+            10, // max retries
+        );
+
+        info!(
+            target: "rks::main",
+            "Service IP allocator initialized with CIDR: {}",
+            service_cidr
+        );
+
+        Some(Arc::new(allocator))
+    } else {
+        info!(
+            target: "rks::main",
+            "Service IP allocator not initialized (no service_cidr configured)"
+        );
+        None
+    };
+
+    Ok((network_config, service_ip_allocator))
 }
 
 async fn launch_scheduler(
