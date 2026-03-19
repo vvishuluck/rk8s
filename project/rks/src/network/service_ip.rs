@@ -619,16 +619,20 @@ pub fn validate_cluster_ip_immutability(
     old_spec: &ServiceSpec,
     new_spec: &ServiceSpec,
 ) -> Result<()> {
-    let old_cluster_ip = old_spec
-        .cluster_ip
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
-    let new_cluster_ip = new_spec
-        .cluster_ip
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+    let normalize_cluster_ip = |v: &Option<String>| {
+        v.as_ref().map(|s| s.trim()).and_then(|s| {
+            if s.is_empty() {
+                None
+            } else if s.eq_ignore_ascii_case("none") {
+                Some("None".to_string())
+            } else {
+                Some(s.to_string())
+            }
+        })
+    };
+
+    let old_cluster_ip = normalize_cluster_ip(&old_spec.cluster_ip);
+    let new_cluster_ip = normalize_cluster_ip(&new_spec.cluster_ip);
 
     // ClusterIP services: cluster_ip is immutable
     if old_spec.service_type == "ClusterIP"

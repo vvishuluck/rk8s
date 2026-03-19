@@ -584,7 +584,50 @@ pub async fn dispatch_user(
                 }
 
                 let yaml = serde_yaml::to_string(&new_svc)?;
-                xline_store.insert_service_yaml(&name, &yaml).await?;
+                let created = xline_store
+                    .insert_service_yaml_if_absent(&name, &yaml)
+                    .await?;
+                if !created {
+                    // Concurrent apply/create won the CAS; avoid leaving orphan IP reservation.
+                    if let Some(ref allocator) = shared.service_ip_allocator {
+                        let should_release = match xline_store.get_service_yaml(&name).await {
+                            Ok(Some(existing_yaml)) => {
+                                if let Ok(existing_svc) =
+                                    serde_yaml::from_str::<ServiceTask>(&existing_yaml)
+                                {
+                                    existing_svc.spec.cluster_ip != new_svc.spec.cluster_ip
+                                } else {
+                                    true
+                                }
+                            }
+                            Ok(None) => true,
+                            Err(_) => true,
+                        };
+
+                        if should_release
+                            && let Err(e) = crate::network::service_ip::deallocate_cluster_ip(
+                                &name,
+                                &new_svc.spec,
+                                allocator.as_ref(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                target: "rks::node::user_dispatch",
+                                "Failed to rollback reserved ClusterIP for concurrent apply on Service {}: {}",
+                                name,
+                                e
+                            );
+                        }
+                    }
+
+                    conn.send_msg(&RksMessage::Error(format!(
+                        "Service {} was created concurrently, please retry apply",
+                        name
+                    )))
+                    .await?;
+                    return Ok(());
+                }
             }
             conn.send_msg(&RksMessage::Ack).await?;
         }
