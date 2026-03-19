@@ -54,8 +54,12 @@ pub struct NetworkConfig {
     #[serde(rename = "ServiceCIDR")]
     pub service_cidr: Option<String>,
 
-    #[serde(rename = "ServiceSubnetLen")]
+    #[serde(rename = "ServiceSubnetLen", default = "default_service_subnet_len")]
     pub service_subnet_len: u8,
+}
+
+fn default_service_subnet_len() -> u8 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize)]

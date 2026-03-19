@@ -11,6 +11,7 @@ use common::{Node, NodeStatus, PodTask, RksMessage, ServiceSpec};
 use log::{error, info, warn};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use tokio::time::{Duration, sleep};
 
 /// Dispatch worker-originated messages
 pub async fn dispatch_worker(
@@ -505,6 +506,34 @@ pub async fn dispatch_user(
                     return Ok(());
                 }
 
+                // Re-run allocation/validation on update path to ensure:
+                // 1) missing legacy cluster_ip gets repaired,
+                // 2) manual cluster_ip is validated and tracked in registry.
+                if let Some(ref allocator) = shared.service_ip_allocator
+                    && let Err(e) = validate_and_allocate_cluster_ip(
+                        &final_svc.metadata.namespace,
+                        &name,
+                        &mut desired_spec,
+                        &shared.network_config,
+                        allocator.registry.as_ref(),
+                        allocator.as_ref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        target: "rks::node::user_dispatch",
+                        "Service {} ClusterIP validation/allocation failed on update: {}",
+                        name,
+                        e
+                    );
+                    conn.send_msg(&RksMessage::Error(format!(
+                        "ClusterIP validation/allocation failed: {}",
+                        e
+                    )))
+                    .await?;
+                    return Ok(());
+                }
+
                 if final_svc.spec != desired_spec {
                     let current_gen = final_svc.metadata.generation.unwrap_or(0);
                     final_svc.metadata.generation = Some(current_gen + 1);
@@ -561,23 +590,10 @@ pub async fn dispatch_user(
         }
 
         RksMessage::DeleteService(name) => {
-            // Deallocate cluster IP before deletion
-            if let Some(ref allocator) = shared.service_ip_allocator
-                && let Ok(Some(existing_yaml)) = xline_store.get_service_yaml(&name).await
-                && let Ok(svc) = serde_yaml::from_str::<ServiceTask>(&existing_yaml)
-                && let Err(e) = crate::network::service_ip::deallocate_cluster_ip(
-                    &name,
-                    &svc.spec,
-                    allocator.as_ref(),
-                )
-                .await
-            {
-                warn!(
-                    target: "rks::node::user_dispatch",
-                    "Failed to deallocate ClusterIP for Service {}: {}",
-                    name, e
-                );
-            }
+            let existing_svc = xline_store
+                .get_service_yaml(&name)
+                .await?
+                .and_then(|yaml| serde_yaml::from_str::<ServiceTask>(&yaml).ok());
 
             xline_store
                 .delete_object(
@@ -591,6 +607,58 @@ pub async fn dispatch_user(
                 "marked Service {} for deletion (background policy)",
                 name
             );
+
+            // Release IP only after Service object is actually removed.
+            if let Some(ref allocator) = shared.service_ip_allocator
+                && let Some(svc) = existing_svc
+            {
+                let xline_store = xline_store.clone();
+                let allocator = allocator.clone();
+                let service_name = name.clone();
+
+                tokio::spawn(async move {
+                    for _ in 0..300 {
+                        match xline_store.get_service_yaml(&service_name).await {
+                            Ok(None) => {
+                                if let Err(e) = crate::network::service_ip::deallocate_cluster_ip(
+                                    &service_name,
+                                    &svc.spec,
+                                    allocator.as_ref(),
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        target: "rks::node::user_dispatch",
+                                        "Failed to deallocate ClusterIP for Service {} after final delete: {}",
+                                        service_name,
+                                        e
+                                    );
+                                }
+                                return;
+                            }
+                            Ok(Some(_)) => {
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "rks::node::user_dispatch",
+                                    "Failed to verify Service {} deletion before IP release: {}",
+                                    service_name,
+                                    e
+                                );
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+
+                    info!(
+                        target: "rks::node::user_dispatch",
+                        "Service {} not fully deleted within timeout, keep ClusterIP reserved",
+                        service_name
+                    );
+                });
+            }
+
             conn.send_msg(&RksMessage::Ack).await?;
         }
 

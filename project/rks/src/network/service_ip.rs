@@ -191,6 +191,7 @@ impl ServiceIpRegistry {
     }
 
     /// Check if a Service IP is allocated in the registry.
+    #[allow(dead_code)]
     pub async fn is_allocated(&self, ip: Ipv4Addr) -> std::result::Result<bool, ServiceIpError> {
         let key = Self::make_key(ip);
         let mut kv = self.kv.lock().await;
@@ -201,6 +202,29 @@ impl ServiceIpRegistry {
             .map_err(|e| ServiceIpError::XlineError(e.to_string()))?;
 
         Ok(!resp.kvs().is_empty())
+    }
+
+    /// Get allocation record for a Service IP.
+    pub async fn get_record(
+        &self,
+        ip: Ipv4Addr,
+    ) -> std::result::Result<Option<ServiceIpRecord>, ServiceIpError> {
+        let key = Self::make_key(ip);
+        let mut kv = self.kv.lock().await;
+
+        let resp = kv
+            .get(key, None)
+            .await
+            .map_err(|e| ServiceIpError::XlineError(e.to_string()))?;
+
+        let Some(kv_pair) = resp.kvs().first() else {
+            return Ok(None);
+        };
+
+        let value_str = std::str::from_utf8(kv_pair.value())?;
+        let record = ServiceIpRecord::from_json(value_str)
+            .map_err(|e| ServiceIpError::AllocationFailed(e.to_string()))?;
+        Ok(Some(record))
     }
 
     /// List all allocated Service IPs in the registry (prefix scan).
@@ -351,6 +375,13 @@ impl ServiceIpAllocator {
             }
         }
 
+        if let Some(ip) = self
+            .allocate_with_linear_probe(service_namespace, service_name)
+            .await?
+        {
+            return Ok(ip);
+        }
+
         Err(anyhow!(
             "failed to allocate Service IP after {} attempts",
             self.max_retries
@@ -371,8 +402,8 @@ impl ServiceIpAllocator {
     ///
     /// This samples from the full CIDR range to avoid hot-spotting on the first few IPs.
     fn generate_candidate_ips(&self, rng: &mut impl Rng) -> Result<Vec<Ipv4Addr>> {
-        const MAX_CANDIDATES: usize = 32;
-        const MAX_SAMPLE_ATTEMPTS: usize = 256;
+        const MAX_CANDIDATES: usize = 256;
+        const MAX_SAMPLE_ATTEMPTS: usize = 4096;
 
         let network = u32::from(self.service_cidr.network());
         let broadcast = u32::from(self.service_cidr.broadcast());
@@ -407,6 +438,61 @@ impl ServiceIpAllocator {
         }
 
         Ok(candidates)
+    }
+
+    /// Fallback linear probe to avoid false "pool exhausted" in larger subnets.
+    ///
+    /// For subnets up to /16, this probes all usable hosts in randomized order.
+    /// For larger subnets, probing is capped for latency protection.
+    async fn allocate_with_linear_probe(
+        &self,
+        service_namespace: String,
+        service_name: String,
+    ) -> Result<Option<Ipv4Addr>> {
+        let network = u32::from(self.service_cidr.network());
+        let broadcast = u32::from(self.service_cidr.broadcast());
+        if broadcast <= network + 1 {
+            return Ok(None);
+        }
+
+        let usable_hosts = (broadcast - network - 1) as usize;
+        let probe_limit = if usable_hosts <= 65_536 {
+            usable_hosts
+        } else {
+            65_536
+        };
+
+        if probe_limit == 0 {
+            return Ok(None);
+        }
+
+        let start = {
+            let mut rng = rand::rng();
+            rng.random_range(0..probe_limit)
+        };
+
+        for offset in 0..probe_limit {
+            let host_idx = ((start + offset) % probe_limit) as u32;
+            let ip = Ipv4Addr::from(network + 1 + host_idx);
+            if is_reserved_service_ip(ip, self.service_cidr) {
+                continue;
+            }
+
+            match self
+                .registry
+                .allocate(ip, service_namespace.clone(), service_name.clone())
+                .await
+            {
+                Ok(()) => {
+                    info!("Service IP allocation succeeded with linear probe: {}", ip);
+                    return Ok(Some(ip));
+                }
+                Err(ServiceIpError::AlreadyAllocated { .. }) => continue,
+                Err(e) => return Err(anyhow!("Service IP allocation failed: {}", e)),
+            }
+        }
+
+        Ok(None)
     }
 
     /// Apply exponential backoff before retry.
@@ -460,63 +546,70 @@ pub async fn validate_and_allocate_cluster_ip(
         .service_cidr
         .ok_or_else(|| anyhow!("ServiceCIDR not configured in network config"))?;
 
-    // Case 1: cluster_ip is not set - auto-allocate
-    if spec.cluster_ip.is_none()
-        || spec
-            .cluster_ip
-            .as_ref()
-            .map(|s| s.is_empty())
-            .unwrap_or(false)
-    {
-        let allocated_ip = allocator
-            .allocate(service_namespace.to_string(), service_name.to_string())
-            .await
-            .context("failed to allocate Service IP")?;
+    match spec.cluster_ip.as_ref().map(|s| s.trim()) {
+        // Case 1: cluster_ip is not set - auto-allocate
+        None | Some("") => {
+            let allocated_ip = allocator
+                .allocate(service_namespace.to_string(), service_name.to_string())
+                .await
+                .context("failed to allocate Service IP")?;
 
-        info!(
-            "Service {}/{}: allocated ClusterIP {}",
-            service_namespace, service_name, allocated_ip
-        );
-        spec.cluster_ip = Some(allocated_ip.to_string());
-        Ok(())
-    } else {
+            info!(
+                "Service {}/{}: allocated ClusterIP {}",
+                service_namespace, service_name, allocated_ip
+            );
+            spec.cluster_ip = Some(allocated_ip.to_string());
+            Ok(())
+        }
         // Case 2: cluster_ip is set - validate format and range
-        let ip_str = spec.cluster_ip.as_ref().unwrap();
+        Some(ip_str) => {
+            // Parse and validate IP format
+            let ip: Ipv4Addr = ip_str
+                .parse()
+                .context(format!("invalid cluster_ip format: {}", ip_str))?;
 
-        // Parse and validate IP format
-        let ip: Ipv4Addr = ip_str
-            .parse()
-            .context(format!("invalid cluster_ip format: {}", ip_str))?;
+            // Validate IP is in Service CIDR range
+            if !service_cidr.contains(ip) {
+                return Err(anyhow!(
+                    "cluster_ip {} is outside Service CIDR range ({})",
+                    ip,
+                    service_cidr
+                ));
+            }
 
-        // Validate IP is in Service CIDR range
-        if !service_cidr.contains(ip) {
-            return Err(anyhow!(
-                "cluster_ip {} is outside Service CIDR range ({})",
-                ip,
-                service_cidr
-            ));
+            // If already allocated, allow only when owned by the same service.
+            if let Some(record) = registry.get_record(ip).await? {
+                if record.service_namespace == service_namespace
+                    && record.service_name == service_name
+                {
+                    info!(
+                        "Service {}/{}: cluster_ip {} already reserved by self",
+                        service_namespace, service_name, ip
+                    );
+                    return Ok(());
+                }
+
+                return Err(anyhow!(
+                    "cluster_ip {} is already allocated to another service ({}/{})",
+                    ip,
+                    record.service_namespace,
+                    record.service_name
+                ));
+            }
+
+            info!(
+                "Service {}/{}: cluster_ip {} validated and reserved",
+                service_namespace, service_name, ip
+            );
+
+            // Reserve the IP in the registry
+            registry
+                .allocate(ip, service_namespace.to_string(), service_name.to_string())
+                .await
+                .context(format!("failed to reserve cluster_ip {}", ip))?;
+
+            Ok(())
         }
-
-        // Check if IP is already allocated
-        if registry.is_allocated(ip).await? {
-            return Err(anyhow!(
-                "cluster_ip {} is already allocated to another service",
-                ip
-            ));
-        }
-
-        info!(
-            "Service {}/{}: cluster_ip {} validated and reserved",
-            service_namespace, service_name, ip
-        );
-
-        // Reserve the IP in the registry
-        registry
-            .allocate(ip, service_namespace.to_string(), service_name.to_string())
-            .await
-            .context(format!("failed to reserve cluster_ip {}", ip))?;
-
-        Ok(())
     }
 }
 
@@ -526,10 +619,22 @@ pub fn validate_cluster_ip_immutability(
     old_spec: &ServiceSpec,
     new_spec: &ServiceSpec,
 ) -> Result<()> {
+    let old_cluster_ip = old_spec
+        .cluster_ip
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+    let new_cluster_ip = new_spec
+        .cluster_ip
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+
     // ClusterIP services: cluster_ip is immutable
     if old_spec.service_type == "ClusterIP"
         && new_spec.service_type == "ClusterIP"
-        && old_spec.cluster_ip != new_spec.cluster_ip
+        && old_cluster_ip.is_some()
+        && old_cluster_ip != new_cluster_ip
     {
         return Err(anyhow!(
             "cluster_ip for service {} cannot be modified: old={:?}, new={:?}",
