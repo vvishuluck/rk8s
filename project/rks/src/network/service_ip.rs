@@ -444,10 +444,12 @@ pub async fn validate_and_allocate_cluster_ip(
         return Ok(());
     }
 
-    // Headless service (no selector) - skip IP assignment
-    if spec.selector.is_none() {
+    // Headless service is identified by `clusterIP: None` (Kubernetes semantics).
+    if let Some(cluster_ip) = spec.cluster_ip.as_ref()
+        && cluster_ip.eq_ignore_ascii_case("none")
+    {
         info!(
-            "Service {}/{}: Headless (no selector), skipping IP allocation",
+            "Service {}/{}: headless service (clusterIP=None), skip ClusterIP allocation",
             service_namespace, service_name
         );
         return Ok(());
@@ -524,11 +526,6 @@ pub fn validate_cluster_ip_immutability(
     old_spec: &ServiceSpec,
     new_spec: &ServiceSpec,
 ) -> Result<()> {
-    // Headless services (no selector) can change anything
-    if old_spec.selector.is_none() || new_spec.selector.is_none() {
-        return Ok(());
-    }
-
     // ClusterIP services: cluster_ip is immutable
     if old_spec.service_type == "ClusterIP"
         && new_spec.service_type == "ClusterIP"

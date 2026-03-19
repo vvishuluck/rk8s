@@ -29,6 +29,8 @@ use cli::{Cli, Commands};
 use libscheduler::plugins::{Plugins, node_resources_fit::ScoringStrategy};
 use libvault::storage::xline::XlineOptions;
 use log::{LevelFilter, error, info};
+use ipnetwork::Ipv4Network;
+use std::collections::{HashMap, HashSet};
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -72,7 +74,7 @@ async fn handle_start_command() -> anyhow::Result<()> {
 
     // Get network config and initialize Service IP allocator
     let (network_config, service_ip_allocator) =
-        init_service_ip_components(cfg, &local_manager, &xline_options).await?;
+        init_service_ip_components(cfg, &local_manager, &xline_options, &xline_store).await?;
 
     register_controllers(
         CONTROLLER_MANAGER.clone(),
@@ -170,6 +172,7 @@ async fn init_service_ip_components(
     cfg: &Config,
     local_manager: &Arc<LocalManager>,
     xline_options: &XlineOptions,
+    xline_store: &Arc<XlineStore>,
 ) -> anyhow::Result<(
     Arc<libnetwork::config::NetworkConfig>,
     Option<Arc<ServiceIpAllocator>>,
@@ -181,22 +184,7 @@ async fn init_service_ip_components(
             ServiceIpRegistry::new(cfg.xline_config.clone(), xline_options.clone()).await?,
         );
 
-        match registry.list_all().await {
-            Ok(records) => {
-                info!(
-                    target: "rks::main",
-                    "Service IP registry loaded: {} existing allocations",
-                    records.len()
-                );
-            }
-            Err(e) => {
-                error!(
-                    target: "rks::main",
-                    "failed to list existing Service IP allocations: {}",
-                    e
-                );
-            }
-        }
+        rebuild_service_ip_registry_from_services(&registry, xline_store, service_cidr).await?;
 
         let allocator = ServiceIpAllocator::new(
             service_cidr,
@@ -220,6 +208,137 @@ async fn init_service_ip_components(
     };
 
     Ok((network_config, service_ip_allocator))
+}
+
+async fn rebuild_service_ip_registry_from_services(
+    registry: &ServiceIpRegistry,
+    xline_store: &Arc<XlineStore>,
+    service_cidr: Ipv4Network,
+) -> anyhow::Result<()> {
+    let existing_records = registry
+        .list_all()
+        .await
+        .context("failed to list existing service-ip records")?;
+
+    let mut current_by_ip = HashMap::with_capacity(existing_records.len());
+    for record in existing_records {
+        current_by_ip.insert(record.ip, (record.service_namespace, record.service_name));
+    }
+
+    let services = xline_store
+        .list_services()
+        .await
+        .context("failed to list services for service-ip rebuild")?;
+
+    let mut desired_by_ip: HashMap<std::net::Ipv4Addr, (String, String)> = HashMap::new();
+    for svc in services {
+        if svc.spec.service_type != "ClusterIP" {
+            continue;
+        }
+
+        let Some(cluster_ip) = svc.spec.cluster_ip.as_ref() else {
+            continue;
+        };
+        let cluster_ip = cluster_ip.trim();
+        if cluster_ip.is_empty() || cluster_ip.eq_ignore_ascii_case("none") {
+            continue;
+        }
+
+        let Ok(ip) = cluster_ip.parse::<std::net::Ipv4Addr>() else {
+            error!(
+                target: "rks::main",
+                "skip invalid Service clusterIP '{}' for {}/{} during rebuild",
+                cluster_ip,
+                svc.metadata.namespace,
+                svc.metadata.name
+            );
+            continue;
+        };
+
+        if !service_cidr.contains(ip) {
+            error!(
+                target: "rks::main",
+                "skip out-of-range Service clusterIP {} for {}/{} during rebuild (serviceCIDR={})",
+                ip,
+                svc.metadata.namespace,
+                svc.metadata.name,
+                service_cidr
+            );
+            continue;
+        }
+
+        let owner = (svc.metadata.namespace.clone(), svc.metadata.name.clone());
+        if let Some(existing_owner) = desired_by_ip.get(&ip)
+            && existing_owner != &owner
+        {
+            error!(
+                target: "rks::main",
+                "detected duplicated Service clusterIP {} between {}/{} and {}/{} during rebuild; keeping first owner",
+                ip,
+                existing_owner.0,
+                existing_owner.1,
+                owner.0,
+                owner.1
+            );
+            continue;
+        }
+
+        desired_by_ip.insert(ip, owner);
+    }
+
+    let desired_ips: HashSet<std::net::Ipv4Addr> = desired_by_ip.keys().copied().collect();
+
+    for ip in current_by_ip.keys() {
+        if !desired_ips.contains(ip)
+            && let Err(e) = registry.release(*ip).await
+        {
+            error!(
+                target: "rks::main",
+                "failed to release stale service-ip record {} during rebuild: {}",
+                ip,
+                e
+            );
+        }
+    }
+
+    for (ip, owner) in desired_by_ip {
+        match current_by_ip.get(&ip) {
+            Some(current_owner) if current_owner == &owner => {
+                continue;
+            }
+            Some(current_owner) => {
+                if let Err(e) = registry.release(ip).await {
+                    error!(
+                        target: "rks::main",
+                        "failed to release conflicted service-ip record {} (current owner {}/{}) during rebuild: {}",
+                        ip,
+                        current_owner.0,
+                        current_owner.1,
+                        e
+                    );
+                    continue;
+                }
+            }
+            None => {}
+        }
+
+        if let Err(e) = registry.allocate(ip, owner.0.clone(), owner.1.clone()).await {
+            error!(
+                target: "rks::main",
+                "failed to rebuild service-ip record {} for {}/{}: {}",
+                ip,
+                owner.0,
+                owner.1,
+                e
+            );
+        }
+    }
+
+    info!(
+        target: "rks::main",
+        "service-ip registry rebuild completed from Service objects"
+    );
+    Ok(())
 }
 
 async fn launch_scheduler(

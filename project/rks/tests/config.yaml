@@ -11,7 +11,7 @@ network_config:
   SubnetMin: "10.1.1.0"
   SubnetMax: "10.1.254.0"
   SubnetLen: 24
-  ServiceCIDR: "10.96.0.0/12"
+  ServiceCIDR: "10.96.0.0/16"
   ServiceSubnetLen: 24
 tls_config:
   enable: false

@@ -476,10 +476,21 @@ pub async fn dispatch_user(
             let name = incoming_svc.metadata.name.clone();
             if let Some(existing_yaml) = xline_store.get_service_yaml(&name).await? {
                 let mut final_svc: ServiceTask = serde_yaml::from_str(&existing_yaml)?;
+                let mut desired_spec = incoming_svc.spec.clone();
+
+                // Preserve allocated ClusterIP when client manifest omits cluster_ip.
+                let incoming_cluster_ip_missing = desired_spec
+                    .cluster_ip
+                    .as_ref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                if incoming_cluster_ip_missing && final_svc.spec.service_type == "ClusterIP" {
+                    desired_spec.cluster_ip = final_svc.spec.cluster_ip.clone();
+                }
 
                 // Validate cluster_ip immutability
                 if let Err(e) =
-                    validate_cluster_ip_immutability(&name, &final_svc.spec, &incoming_svc.spec)
+                    validate_cluster_ip_immutability(&name, &final_svc.spec, &desired_spec)
                 {
                     warn!(
                         target: "rks::node::user_dispatch",
@@ -494,10 +505,10 @@ pub async fn dispatch_user(
                     return Ok(());
                 }
 
-                if final_svc.spec != incoming_svc.spec {
+                if final_svc.spec != desired_spec {
                     let current_gen = final_svc.metadata.generation.unwrap_or(0);
                     final_svc.metadata.generation = Some(current_gen + 1);
-                    final_svc.spec = incoming_svc.spec.clone();
+                    final_svc.spec = desired_spec;
                     info!(
                         target: "rks::node::user_dispatch",
                         "Service {} spec updated, add generation",
@@ -512,7 +523,38 @@ pub async fn dispatch_user(
                     name
                 );
             } else {
-                let yaml = serde_yaml::to_string(&*incoming_svc)?;
+                let mut new_svc = (*incoming_svc).clone();
+
+                if let Some(ref allocator) = shared.service_ip_allocator
+                    && let Err(e) = validate_and_allocate_cluster_ip(
+                        &new_svc.metadata.namespace,
+                        &new_svc.metadata.name,
+                        &mut new_svc.spec,
+                        &shared.network_config,
+                        allocator.registry.as_ref(),
+                        allocator.as_ref(),
+                    )
+                    .await
+                {
+                    warn!(
+                        target: "rks::node::user_dispatch",
+                        "Service {} ClusterIP allocation failed on upsert-create: {}",
+                        new_svc.metadata.name,
+                        e
+                    );
+                    conn.send_msg(&RksMessage::Error(format!(
+                        "ClusterIP allocation failed: {}",
+                        e
+                    )))
+                    .await?;
+                    return Ok(());
+                }
+
+                if new_svc.metadata.creation_timestamp.is_none() {
+                    new_svc.metadata.creation_timestamp = Some(Utc::now());
+                }
+
+                let yaml = serde_yaml::to_string(&new_svc)?;
                 xline_store.insert_service_yaml(&name, &yaml).await?;
             }
             conn.send_msg(&RksMessage::Ack).await?;
