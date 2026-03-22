@@ -665,9 +665,9 @@ pub async fn deallocate_cluster_ip(
     spec: &ServiceSpec,
     allocator: &ServiceIpAllocator,
 ) -> Result<()> {
-    // Only deallocate if service has a cluster_ip assigned
-    let cluster_ip_str = match &spec.cluster_ip {
-        Some(ip) if !ip.is_empty() => ip,
+    // Only deallocate when cluster_ip is a real allocatable IP.
+    let cluster_ip_str = match spec.cluster_ip.as_ref().map(|s| s.trim()) {
+        Some(ip) if !ip.is_empty() && !ip.eq_ignore_ascii_case("none") => ip,
         _ => return Ok(()),
     };
 

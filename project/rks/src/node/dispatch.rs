@@ -89,9 +89,10 @@ pub async fn dispatch_worker(
 /// Validate Service spec before creation or update.
 ///
 /// Checks:
-/// - ClusterIP format (if specified)
-/// - ClusterIP range validation
-/// - Headless service detection
+/// - ClusterIP IPv4 format (if specified)
+///
+/// Range validation and allocation semantics are handled by
+/// `validate_and_allocate_cluster_ip` for a single source of truth.
 fn validate_service_spec(spec: &ServiceSpec) -> anyhow::Result<()> {
     // Only validate ClusterIP services
     if spec.service_type != "ClusterIP" {
@@ -100,11 +101,12 @@ fn validate_service_spec(spec: &ServiceSpec) -> anyhow::Result<()> {
 
     // If cluster_ip is specified, validate format
     if let Some(ref ip_str) = spec.cluster_ip
-        && !ip_str.is_empty()
-        && ip_str != "None"
+        && !ip_str.trim().is_empty()
+        && !ip_str.trim().eq_ignore_ascii_case("none")
     {
         // Try to parse as IPv4 address
         ip_str
+            .trim()
             .parse::<Ipv4Addr>()
             .map_err(|_| anyhow::anyhow!("invalid cluster_ip format: {}", ip_str))?;
         info!("Service cluster_ip validation passed: {}", ip_str);
