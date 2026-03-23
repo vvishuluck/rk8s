@@ -203,6 +203,15 @@ pub fn validate_network_config(cfg: &mut NetworkConfig) -> Result<()> {
     if let Some(service_cidr) = cfg.service_cidr {
         let prefix = service_cidr.prefix();
 
+        // Service CIDR must provide at least one usable host address.
+        if prefix >= 31 {
+            anyhow::bail!(
+                "ServiceCIDR {} has no allocatable host addresses (prefix /{} is too narrow)",
+                service_cidr,
+                prefix
+            );
+        }
+
         // Validate service subnet length
         if cfg.service_subnet_len > 0 {
             if cfg.service_subnet_len > 30 {

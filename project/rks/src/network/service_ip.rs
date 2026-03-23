@@ -724,7 +724,10 @@ mod tests {
 
         // Other *.1 addresses in the same /16 should remain allocatable.
         assert!(!is_reserved_service_ip(Ipv4Addr::new(10, 96, 1, 1), subnet));
-        assert!(!is_reserved_service_ip(Ipv4Addr::new(10, 96, 200, 1), subnet));
+        assert!(!is_reserved_service_ip(
+            Ipv4Addr::new(10, 96, 200, 1),
+            subnet
+        ));
     }
 
     #[test]
