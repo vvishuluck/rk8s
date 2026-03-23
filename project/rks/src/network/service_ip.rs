@@ -260,7 +260,7 @@ impl ServiceIpRegistry {
 /// Reserved IP addresses in an IPv4 subnet that cannot be allocated.
 /// Based on Kubernetes and RFC standards:
 /// - .0: network address
-/// - .1: gateway/API server
+/// - first host of the whole ServiceCIDR: gateway/API server
 /// - .254: typically reserved for gateways
 /// - .255: broadcast address
 pub fn is_reserved_service_ip(ip: Ipv4Addr, subnet: Ipv4Network) -> bool {
@@ -274,12 +274,13 @@ pub fn is_reserved_service_ip(ip: Ipv4Addr, subnet: Ipv4Network) -> bool {
         return true;
     }
 
-    let octets = ip.octets();
-
-    // .1 (gateway) - for /24 and larger networks
-    if subnet.prefix() <= 24 && octets[3] == 1 {
+    // First host address of the whole CIDR (often used as gateway/API server)
+    let first_host = Ipv4Addr::from(u32::from(subnet.ip()) + 1);
+    if ip == first_host {
         return true;
     }
+
+    let octets = ip.octets();
 
     // .254 for /24 subnets (often used as secondary gateway)
     if subnet.prefix() == 24 && octets[3] == 254 {
@@ -712,6 +713,18 @@ mod tests {
             Ipv4Addr::new(10, 96, 0, 200),
             subnet
         ));
+    }
+
+    #[test]
+    fn test_first_host_only_reserved_for_broad_cidr() {
+        let subnet: Ipv4Network = "10.96.0.0/16".parse().unwrap();
+
+        // First host of the whole /16 should be reserved.
+        assert!(is_reserved_service_ip(Ipv4Addr::new(10, 96, 0, 1), subnet));
+
+        // Other *.1 addresses in the same /16 should remain allocatable.
+        assert!(!is_reserved_service_ip(Ipv4Addr::new(10, 96, 1, 1), subnet));
+        assert!(!is_reserved_service_ip(Ipv4Addr::new(10, 96, 200, 1), subnet));
     }
 
     #[test]

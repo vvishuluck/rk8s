@@ -520,7 +520,7 @@ pub async fn dispatch_user(
                     .as_ref()
                     .map(|s| s.trim().is_empty())
                     .unwrap_or(true);
-                if incoming_cluster_ip_missing && final_svc.spec.service_type == "ClusterIP" {
+                if incoming_cluster_ip_missing {
                     desired_spec.cluster_ip = final_svc.spec.cluster_ip.clone();
                 }
 
