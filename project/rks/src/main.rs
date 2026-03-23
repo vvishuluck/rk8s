@@ -232,10 +232,6 @@ async fn rebuild_service_ip_registry_from_services(
 
     let mut desired_by_ip: HashMap<std::net::Ipv4Addr, (String, String)> = HashMap::new();
     for svc in services {
-        if svc.spec.service_type != "ClusterIP" {
-            continue;
-        }
-
         let Some(cluster_ip) = svc.spec.cluster_ip.as_ref() else {
             continue;
         };
