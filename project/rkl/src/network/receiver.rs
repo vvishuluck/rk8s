@@ -12,8 +12,10 @@ use nftables::{helper, schema};
 use quinn::{ClientConfig, Endpoint};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -304,13 +306,55 @@ impl NetworkReceiver {
             rules.len()
         );
 
-        let nftables: schema::Nftables = serde_json::from_str(&rules).map_err(|e| {
-            anyhow::anyhow!("Failed to deserialize nftables JSON to crate schema: {}", e)
-        })?;
-
-        task::spawn_blocking(move || helper::apply_ruleset(&nftables))
+        let apply_res = if is_verdict_map_init_rules(&rules) {
+            info!(
+                "Applying nftables map_init payload via raw helper on node {}",
+                node_id
+            );
+            let raw_rules = rules.clone();
+            task::spawn_blocking(move || {
+                helper::apply_ruleset_raw(&raw_rules, None::<&String>, ["-j", "-f", "-"])
+                    .map(|_| ())
+            })
             .await?
-            .map_err(|e| anyhow::anyhow!("nftables::helper::apply_ruleset failed: {}", e))?;
+        } else {
+            let parsed_rules = serde_json::from_str::<schema::Nftables>(&rules);
+            match parsed_rules {
+                Ok(nftables) => {
+                    task::spawn_blocking(move || helper::apply_ruleset(&nftables)).await?
+                }
+                Err(parse_err) => {
+                    warn!(
+                        "Falling back to helper::apply_ruleset_raw for node {} due to schema parse error: {}",
+                        node_id, parse_err
+                    );
+                    let raw_rules = rules.clone();
+                    task::spawn_blocking(move || {
+                        helper::apply_ruleset_raw(&raw_rules, None::<&String>, ["-j", "-f", "-"])
+                            .map(|_| ())
+                    })
+                    .await?
+                }
+            }
+        };
+
+        if let Err(e) = apply_res {
+            let rules_for_diag = rules;
+            let diag = task::spawn_blocking(move || collect_nft_check_diagnostics(&rules_for_diag))
+                .await
+                .unwrap_or_else(|join_err| {
+                    format!(
+                        "failed to collect nft diagnostics due to join error: {}",
+                        join_err
+                    )
+                });
+
+            return Err(anyhow::anyhow!(
+                "nftables::helper::apply_ruleset failed: {}; nft --check diagnostics: {}",
+                e,
+                diag
+            ));
+        }
 
         Ok(())
     }
@@ -412,6 +456,93 @@ impl NetworkReceiver {
             route_count,
             v6_route_count,
         }
+    }
+}
+
+fn is_verdict_map_init_rules(rules: &str) -> bool {
+    let value: serde_json::Value = match serde_json::from_str(rules) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let nftables = match value.get("nftables").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    let mut found_cluster_ips = false;
+    let mut found_node_ports = false;
+
+    for item in nftables {
+        let Some(map_obj) = item.get("map").and_then(|v| v.as_object()) else {
+            continue;
+        };
+
+        let map_kind = map_obj.get("map").and_then(|v| v.as_str());
+        let name = map_obj.get("name").and_then(|v| v.as_str());
+
+        if map_kind == Some("verdict") {
+            match name {
+                Some("cluster_ips") => found_cluster_ips = true,
+                Some("node_ports") => found_node_ports = true,
+                _ => {}
+            }
+        }
+
+        if found_cluster_ips && found_node_ports {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn collect_nft_check_diagnostics(rules: &str) -> String {
+    let mut child = match Command::new("nft")
+        .args(["-j", "--check", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => return format!("failed to spawn nft --check: {}", err),
+    };
+
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(err) = stdin.write_all(rules.as_bytes())
+    {
+        return format!("failed to write rules to nft stdin: {}", err);
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(out) => out,
+        Err(err) => return format!("failed to wait for nft --check output: {}", err),
+    };
+
+    let stdout = truncate_for_log(&String::from_utf8_lossy(&output.stdout), 4000);
+    let stderr = truncate_for_log(&String::from_utf8_lossy(&output.stderr), 4000);
+
+    format!(
+        "exit_status={}; stdout={}; stderr={}",
+        output.status, stdout, stderr
+    )
+}
+
+fn truncate_for_log(s: &str, max_chars: usize) -> String {
+    let mut it = s.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        if let Some(c) = it.next() {
+            out.push(c);
+        } else {
+            return out;
+        }
+    }
+    if it.next().is_some() {
+        format!("{}...(truncated)", out)
+    } else {
+        out
     }
 }
 

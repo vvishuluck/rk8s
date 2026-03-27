@@ -704,9 +704,11 @@ fn parse_srv_query(
 
 /// Ensure `nat` table in the ip family and `PREROUTING` chain exist
 pub async fn ensure_nat_prerouting_chain() -> Result<()> {
-    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
+    let current = tokio::task::spawn_blocking(|| {
+        nft_helper::get_current_ruleset_with_args(None::<&String>, ["list", "table", "ip", "nat"])
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
 
     let table_exists = current.objects.iter().any(|obj| match obj {
         NfObject::ListObject(NfListObject::Table(t)) => t.family == NfFamily::IP && t.name == "nat",
@@ -812,9 +814,11 @@ pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<
     let mut objects: Vec<NfObject> = Vec::new();
 
     // Ensure a clean base: delete any existing rules with our comment, then re-add
-    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
-        .await
-        .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?;
+    let current = tokio::task::spawn_blocking(|| {
+        nft_helper::get_current_ruleset_with_args(None::<&String>, ["list", "table", "ip", "nat"])
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?;
 
     if let Ok(ruleset) = current {
         let mut delete_objects: Vec<NfObject> = Vec::new();
@@ -976,9 +980,11 @@ pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<
 pub async fn cleanup_dns_nftable() -> anyhow::Result<()> {
     // Identify rules previously added by `setup_dns_nftable` by their comment
     // `rk8s-dns-redirect`, obtain handles, and delete them using the nft JSON API.
-    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+    let current = tokio::task::spawn_blocking(|| {
+        nft_helper::get_current_ruleset_with_args(None::<&String>, ["list", "table", "ip", "nat"])
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
 
     let nft = match current {
         Ok(n) => n,
