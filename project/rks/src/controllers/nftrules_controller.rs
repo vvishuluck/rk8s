@@ -239,17 +239,19 @@ impl NftablesController {
                                         }
 
                                         let map_init_rules = libnetwork::nftables::generate_verdict_maps_init_raw_json()?;
-                                        let full_rules = generate_nftables_config(&services, &endpoints)?;
+                                        let full_rules = libnetwork::nftables::generate_nftables_config(&services, &endpoints)?;
+                                        let discovery_rules = generate_services_discovery_refresh(&services)?;
+
                                         NftablesController::broadcast_two_phase_full_rules(
                                             &node_registry_c,
                                             &out_of_sync_c,
                                             map_init_rules,
                                             full_rules,
                                             "worker_deleted_service_full_sync",
+                                            discovery_rules.clone(),
                                         )
                                         .await?;
 
-                                        let discovery_rules = generate_services_discovery_refresh(&services)?;
                                         NftablesController::broadcast_discovery_refresh_rules(
                                             &node_registry_c,
                                             &out_of_sync_c,
@@ -358,17 +360,19 @@ impl NftablesController {
                                     }
 
                                     let map_init_rules = libnetwork::nftables::generate_verdict_maps_init_raw_json()?;
-                                    let full_rules = generate_nftables_config(&services, &endpoints)?;
+                                    let full_rules = libnetwork::nftables::generate_nftables_config(&services, &endpoints)?;
+                                    let discovery_rules = generate_services_discovery_refresh(&services)?;
+
                                     NftablesController::broadcast_two_phase_full_rules(
                                         &node_registry_c,
                                         &out_of_sync_c,
                                         map_init_rules,
                                         full_rules,
                                         "worker_spec_change_full_sync",
+                                        discovery_rules.clone(),
                                     )
                                     .await?;
 
-                                    let discovery_rules = generate_services_discovery_refresh(&services)?;
                                     NftablesController::broadcast_discovery_refresh_rules(
                                         &node_registry_c,
                                         &out_of_sync_c,
@@ -532,24 +536,46 @@ impl NftablesController {
         // 1) regular full ruleset payload (contains flush table)
         // 2) raw verdict-map initialization
         let map_init_rules = libnetwork::nftables::generate_verdict_maps_init_raw_json()?;
-        let full_rules = generate_nftables_config(&services, &endpoints)?;
+        let full_rules = libnetwork::nftables::generate_nftables_config(&services, &endpoints)?;
+        let discovery_rules = generate_services_discovery_refresh(&services)?;
 
-        self.broadcast_full_rules(map_init_rules, full_rules)
+        // Seed snapshot cache to prevent "first-seen" service updates on subsequent watch events
+        // after full sync has already created the chains.
+        {
+            let mut snapshots = self.service_snapshots.write().await;
+            for svc in &services {
+                let service_key = svc.metadata.name.clone();
+                let svc_yaml = serde_yaml::to_string(svc).unwrap_or_default();
+                let ep_yaml = endpoints
+                    .iter()
+                    .find(|e| e.metadata.name == svc.metadata.name)
+                    .map(|e| serde_yaml::to_string(e).unwrap_or_default())
+                    .unwrap_or_default();
+                snapshots.insert(service_key, (svc_yaml, ep_yaml));
+            }
+        }
+
+        self.broadcast_full_rules(map_init_rules, full_rules, discovery_rules.clone())
             .await?;
 
-        let discovery_rules = generate_services_discovery_refresh(&services)?;
         let _ = self.broadcast_incremental_rules(discovery_rules).await?;
 
         Ok(())
     }
 
-    async fn broadcast_full_rules(&self, map_init_rules: String, full_rules: String) -> Result<()> {
+    async fn broadcast_full_rules(
+        &self,
+        map_init_rules: String,
+        full_rules: String,
+        discovery_rules: String,
+    ) -> Result<()> {
         Self::broadcast_two_phase_full_rules(
             &self.node_registry,
             &self.out_of_sync,
             map_init_rules,
             full_rules,
             "controller_full_sync",
+            discovery_rules,
         )
         .await
     }
@@ -560,6 +586,7 @@ impl NftablesController {
         map_init_rules: String,
         full_rules: String,
         reason: &str,
+        discovery_rules: String,
     ) -> Result<()> {
         let sessions = node_registry.list_sessions().await;
         if sessions.is_empty() {
@@ -622,6 +649,7 @@ impl NftablesController {
                 map_init_rules,
                 full_rules,
                 reason.to_string(),
+                discovery_rules,
             );
 
             warn!(
@@ -640,6 +668,7 @@ impl NftablesController {
         map_init_rules: String,
         full_rules: String,
         reason: String,
+        discovery_rules: String,
     ) {
         const MAX_ATTEMPTS: usize = 3;
         const BACKOFF_MS: u64 = 300;
@@ -648,6 +677,7 @@ impl NftablesController {
             let mut pending: HashSet<String> = failed_nodes.into_iter().collect();
             let full_msg = common::RksMessage::SetNftablesRules(full_rules);
             let map_init_msg = common::RksMessage::SetNftablesRules(map_init_rules);
+            let discovery_msg = common::RksMessage::UpdateNftablesRules(discovery_rules);
 
             for attempt in 1..=MAX_ATTEMPTS {
                 if pending.is_empty() {
@@ -673,6 +703,15 @@ impl NftablesController {
                             if let Err(e) = session.tx.try_send(map_init_msg.clone()) {
                                 warn!(
                                     "two-phase retry {}/{} failed at phase=map_init node={} reason={} err={}",
+                                    attempt, MAX_ATTEMPTS, node_id, reason, e
+                                );
+                                continue;
+                            }
+
+                            // Replay discovery refresh immediately after successful full rules + map_init
+                            if let Err(e) = session.tx.try_send(discovery_msg.clone()) {
+                                warn!(
+                                    "two-phase retry {}/{} failed at phase=discovery_refresh node={} reason={} err={}",
                                     attempt, MAX_ATTEMPTS, node_id, reason, e
                                 );
                                 continue;
