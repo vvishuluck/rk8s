@@ -21,6 +21,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task;
 
+const RK8S_TABLE_NAME: &str = "rk8s";
+const RK8S_MAP_CLUSTER_IPS: &str = "cluster_ips";
+const RK8S_MAP_NODE_PORTS: &str = "node_ports";
+
 /// Main network configuration receiver that coordinates subnet and route configuration
 /// This will be the primary interface for receiving network configurations from rks
 pub struct NetworkReceiver {
@@ -308,21 +312,21 @@ impl NetworkReceiver {
 
         let apply_res = if is_verdict_map_init_rules(&rules) {
             info!(
-                "Applying nftables map_init payload via raw helper on node {}",
+                "Applying nftables map_init payload via raw nft command on node {}",
                 node_id
             );
             let raw_rules = rules.clone();
+            let node_id_cl = node_id.to_string();
             task::spawn_blocking(move || {
-                helper::apply_ruleset_raw(&raw_rules, None::<&String>, ["-j", "-f", "-"])
-                    .map(|_| ())
+                apply_map_init_payload_with_repair(&node_id_cl, &raw_rules)
             })
             .await?
         } else {
             let parsed_rules = serde_json::from_str::<schema::Nftables>(&rules);
             match parsed_rules {
-                Ok(nftables) => {
-                    task::spawn_blocking(move || helper::apply_ruleset(&nftables)).await?
-                }
+                Ok(nftables) => task::spawn_blocking(move || helper::apply_ruleset(&nftables))
+                    .await?
+                    .map_err(Into::into),
                 Err(parse_err) => {
                     warn!(
                         "Falling back to helper::apply_ruleset_raw for node {} due to schema parse error: {}",
@@ -334,6 +338,7 @@ impl NetworkReceiver {
                             .map(|_| ())
                     })
                     .await?
+                    .map_err(Into::into)
                 }
             }
         };
@@ -457,6 +462,125 @@ impl NetworkReceiver {
             v6_route_count,
         }
     }
+}
+
+fn apply_map_init_payload_with_repair(node_id: &str, raw_rules: &str) -> Result<()> {
+    match apply_ruleset_raw_with_output(raw_rules) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let err_text = err.to_string();
+            if !err_text.contains("File exists") {
+                return Err(err);
+            }
+
+            if nodeports_map_is_protocol_aware() {
+                info!(
+                    "map_init payload is already applied on node {}; treating File exists as success",
+                    node_id
+                );
+                return Ok(());
+            }
+
+            warn!(
+                "map_init apply hit File exists on node {}; trying verdict-map repair and retry",
+                node_id
+            );
+
+            // Best-effort cleanup for stale verdict maps (e.g. old node_ports type).
+            // Ignore missing-map errors so retry remains idempotent.
+            best_effort_delete_map(RK8S_TABLE_NAME, RK8S_MAP_NODE_PORTS);
+            best_effort_delete_map(RK8S_TABLE_NAME, RK8S_MAP_CLUSTER_IPS);
+
+            apply_ruleset_raw_with_output(raw_rules)
+        }
+    }
+}
+
+fn apply_ruleset_raw_with_output(raw_rules: &str) -> Result<()> {
+    let mut child = Command::new("nft")
+        .args(["-j", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("failed to spawn nft: {}", err))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(raw_rules.as_bytes())
+            .map_err(|err| anyhow::anyhow!("failed to write rules to nft stdin: {}", err))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| anyhow::anyhow!("failed to wait nft output: {}", err))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = truncate_for_log(&String::from_utf8_lossy(&output.stdout), 2000);
+    let stderr = truncate_for_log(&String::from_utf8_lossy(&output.stderr), 2000);
+    Err(anyhow::anyhow!(
+        "nft raw apply failed status={} stdout={} stderr={}",
+        output.status,
+        stdout,
+        stderr
+    ))
+}
+
+fn nodeports_map_is_protocol_aware() -> bool {
+    let output = match Command::new("nft")
+        .args(["list", "map", "ip", RK8S_TABLE_NAME, RK8S_MAP_NODE_PORTS])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    stdout.contains("type inet_proto . inet_service")
+}
+
+fn best_effort_delete_map(table: &str, map_name: &str) {
+    let output = match Command::new("nft")
+        .args(["delete", "map", "ip", table, map_name])
+        .output()
+    {
+        Ok(out) => out,
+        Err(err) => {
+            warn!(
+                "failed to execute nft delete map ip {} {}: {}",
+                table, map_name, err
+            );
+            return;
+        }
+    };
+
+    if output.status.success() {
+        info!(
+            "deleted nft map ip {} {} before map_init retry",
+            table, map_name
+        );
+        return;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No such file or directory") {
+        return;
+    }
+
+    warn!(
+        "nft delete map ip {} {} failed status={:?} stderr={}",
+        table,
+        map_name,
+        output.status.code(),
+        stderr.trim()
+    );
 }
 
 fn is_verdict_map_init_rules(rules: &str) -> bool {

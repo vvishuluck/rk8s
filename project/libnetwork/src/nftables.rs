@@ -78,7 +78,7 @@ pub fn generate_verdict_maps_init_raw_json() -> Result<String> {
                     "family": "ip",
                     "table": TABLE_NAME,
                     "name": MAP_NODE_PORTS,
-                    "type": "inet_service",
+                    "type": ["inet_proto", "inet_service"],
                     "map": "verdict"
                 }
             }
@@ -942,12 +942,20 @@ fn cluster_ip_lookup_key_expr(protocol: String) -> expr::Expression<'static> {
 }
 
 fn nodeport_lookup_key_expr(protocol: String) -> expr::Expression<'static> {
-    expr::Expression::Named(expr::NamedExpression::Payload(expr::Payload::PayloadField(
-        expr::PayloadField {
-            protocol: Cow::Owned(protocol),
-            field: Cow::Borrowed("dport"),
-        },
-    )))
+    expr::Expression::Named(expr::NamedExpression::Concat(vec![
+        expr::Expression::Named(expr::NamedExpression::Payload(expr::Payload::PayloadField(
+            expr::PayloadField {
+                protocol: Cow::Borrowed("ip"),
+                field: Cow::Borrowed("protocol"),
+            },
+        ))),
+        expr::Expression::Named(expr::NamedExpression::Payload(expr::Payload::PayloadField(
+            expr::PayloadField {
+                protocol: Cow::Owned(protocol),
+                field: Cow::Borrowed("dport"),
+            },
+        ))),
+    ]))
 }
 
 fn service_ips_map_key_expr(
@@ -961,8 +969,18 @@ fn service_ips_map_key_expr(
     ]))
 }
 
-fn nodeports_map_key_expr(_protocol: &str, port: u32) -> expr::Expression<'static> {
-    expr::Expression::Number(port)
+fn l4proto_number(protocol: &str) -> u32 {
+    match protocol {
+        "udp" => 17,
+        _ => 6,
+    }
+}
+
+fn nodeports_map_key_expr(protocol: &str, port: u32) -> expr::Expression<'static> {
+    expr::Expression::Named(expr::NamedExpression::Concat(vec![
+        expr::Expression::Number(l4proto_number(protocol)),
+        expr::Expression::Number(port),
+    ]))
 }
 
 fn set_item_to_map_elem_expr(item: expr::SetItem<'static>) -> Option<expr::Expression<'static>> {

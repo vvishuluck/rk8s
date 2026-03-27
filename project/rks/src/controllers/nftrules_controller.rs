@@ -578,8 +578,8 @@ impl NftablesController {
             full_rules.len()
         );
 
-        let full_msg = common::RksMessage::SetNftablesRules(full_rules);
-        let map_init_msg = common::RksMessage::SetNftablesRules(map_init_rules);
+        let full_msg = common::RksMessage::SetNftablesRules(full_rules.clone());
+        let map_init_msg = common::RksMessage::SetNftablesRules(map_init_rules.clone());
         let mut failed_nodes = Vec::new();
 
         for (node_id, session) in sessions {
@@ -611,16 +611,100 @@ impl NftablesController {
 
         if !failed_nodes.is_empty() {
             let mut set = out_of_sync.lock().await;
-            for n in failed_nodes {
-                set.insert(n);
+            for n in &failed_nodes {
+                set.insert(n.clone());
             }
+
+            Self::retry_two_phase_broadcast(
+                node_registry.clone(),
+                out_of_sync.clone(),
+                failed_nodes,
+                map_init_rules,
+                full_rules,
+                reason.to_string(),
+            );
+
             warn!(
-                "two-phase broadcast had partial failures for reason={}; continuing with follow-up discovery refresh for healthy nodes",
+                "two-phase broadcast had partial failures for reason={}; queued retries for failed nodes and continuing with discovery refresh for healthy nodes",
                 reason
             );
         }
 
         Ok(())
+    }
+
+    fn retry_two_phase_broadcast(
+        node_registry: Arc<NodeRegistry>,
+        out_of_sync: Arc<Mutex<HashSet<String>>>,
+        failed_nodes: Vec<String>,
+        map_init_rules: String,
+        full_rules: String,
+        reason: String,
+    ) {
+        const MAX_ATTEMPTS: usize = 3;
+        const BACKOFF_MS: u64 = 300;
+
+        tokio::spawn(async move {
+            let mut pending: HashSet<String> = failed_nodes.into_iter().collect();
+            let full_msg = common::RksMessage::SetNftablesRules(full_rules);
+            let map_init_msg = common::RksMessage::SetNftablesRules(map_init_rules);
+
+            for attempt in 1..=MAX_ATTEMPTS {
+                if pending.is_empty() {
+                    return;
+                }
+
+                sleep(Duration::from_millis(BACKOFF_MS * attempt as u64)).await;
+
+                let nodes: Vec<String> = pending.iter().cloned().collect();
+                let mut successes = Vec::new();
+
+                for node_id in nodes {
+                    match node_registry.get(&node_id).await {
+                        Some(session) => {
+                            if let Err(e) = session.tx.try_send(full_msg.clone()) {
+                                warn!(
+                                    "two-phase retry {}/{} failed at phase=full_rules node={} reason={} err={}",
+                                    attempt, MAX_ATTEMPTS, node_id, reason, e
+                                );
+                                continue;
+                            }
+
+                            if let Err(e) = session.tx.try_send(map_init_msg.clone()) {
+                                warn!(
+                                    "two-phase retry {}/{} failed at phase=map_init node={} reason={} err={}",
+                                    attempt, MAX_ATTEMPTS, node_id, reason, e
+                                );
+                                continue;
+                            }
+
+                            successes.push(node_id);
+                        }
+                        None => {
+                            warn!(
+                                "two-phase retry {}/{} no active session node={} reason={}",
+                                attempt, MAX_ATTEMPTS, node_id, reason
+                            );
+                        }
+                    }
+                }
+
+                if !successes.is_empty() {
+                    let mut set = out_of_sync.lock().await;
+                    for node_id in successes {
+                        pending.remove(&node_id);
+                        set.remove(&node_id);
+                    }
+                }
+            }
+
+            if !pending.is_empty() {
+                warn!(
+                    "two-phase retries exhausted for reason={}; nodes remain out-of-sync: {:?}",
+                    reason, pending
+                );
+            }
+        });
     }
 
     async fn broadcast_discovery_refresh_rules(
@@ -795,39 +879,49 @@ impl NftablesController {
     }
 
     async fn schedule_enqueue(&self, key: String, delay: Duration) {
-        // If already marked dirty, it's already scheduled/needs processing -> dedupe
-        {
-            let mut d = self.dirty.write().await;
-            if d.contains(&key) {
-                info!("nftables: enqueue dedupe (already dirty) service_key={key}");
-                return;
-            }
-            // mark as needing processing
-            d.insert(key.clone());
-            info!("nftables: marked dirty service_key={key}");
-        }
-
         let q = self.queue_tx.clone();
         let queued_c = self.queued.clone();
         let processing_c = self.processing.clone();
+        let dirty_c = self.dirty.clone();
 
         // spawn a timer for delayed enqueue (delay may be zero)
         tokio::spawn(async move {
             sleep(delay).await;
 
-            // If the key is currently being processed, do nothing — the worker will
-            // observe `dirty` and requeue when it finishes. Otherwise enqueue if
-            // not already queued.
+            // If the key is currently being processed, mark it dirty so worker
+            // requeues once after finishing. Do not enqueue directly here.
             let in_processing = { processing_c.read().await.contains(&key) };
             if in_processing {
+                let inserted = { dirty_c.write().await.insert(key.clone()) };
+                if inserted {
+                    info!("nftables: marked dirty while processing service_key={key}");
+                } else {
+                    info!("nftables: enqueue dedupe (already dirty) service_key={key}");
+                }
                 info!("nftables: in processing; will requeue later service_key={key}");
                 return;
             }
 
-            let currently_queued = { queued_c.read().await.contains(&key) };
-            if !currently_queued {
-                let _ = q.send(key.clone()).await;
-                queued_c.write().await.insert(key.clone());
+            // Deduplicate delayed enqueues atomically under one write lock.
+            let should_enqueue = {
+                let mut qd = queued_c.write().await;
+                if qd.contains(&key) {
+                    false
+                } else {
+                    qd.insert(key.clone());
+                    true
+                }
+            };
+
+            if !should_enqueue {
+                info!("nftables: enqueue dedupe (already queued) service_key={key}");
+                return;
+            }
+
+            if let Err(e) = q.send(key.clone()).await {
+                queued_c.write().await.remove(&key);
+                warn!("nftables: failed to enqueue service_key={} err={}", key, e);
+            } else {
                 info!(
                     "nftables: enqueue service_key={key} delay_ms={}",
                     delay.as_millis()

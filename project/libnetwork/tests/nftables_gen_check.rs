@@ -9,6 +9,16 @@ use libnetwork::nftables::{
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+fn object_rule<'a>(obj: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    obj.get("rule")
+        .or_else(|| obj.get("add").and_then(|add| add.get("rule")))
+}
+
+fn object_chain<'a>(obj: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    obj.get("chain")
+        .or_else(|| obj.get("add").and_then(|add| add.get("chain")))
+}
+
 fn diagnose_transport_payloads(json_str: &str) {
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
         && let Some(arr) = val.get("nftables").and_then(|v| v.as_array())
@@ -67,7 +77,11 @@ fn diagnose_transport_payloads(json_str: &str) {
 fn has_vmap_statement(rule: &serde_json::Value) -> bool {
     rule.get("expr")
         .and_then(|v| v.as_array())
-        .map(|exprs| exprs.iter().any(|expr| expr.get("vmap").is_some()))
+        .map(|exprs| {
+            exprs
+                .iter()
+                .any(|expr| expr.get("vmap").is_some() || expr.get("map").is_some())
+        })
         .unwrap_or(false)
 }
 
@@ -90,7 +104,7 @@ fn has_chain_object(json: &serde_json::Value, chain_name: &str) -> bool {
         .and_then(|v| v.as_array())
         .map(|objects| {
             objects.iter().any(|obj| {
-                obj.get("chain")
+                object_chain(obj)
                     .and_then(|c| c.get("name"))
                     .and_then(|v| v.as_str())
                     == Some(chain_name)
@@ -104,7 +118,7 @@ fn has_vmap_rule_in_chain(json: &serde_json::Value, chain_name: &str) -> bool {
         .and_then(|v| v.as_array())
         .map(|objects| {
             objects.iter().any(|obj| {
-                obj.get("rule")
+                object_rule(obj)
                     .and_then(|rule| {
                         let same_chain =
                             rule.get("chain").and_then(|v| v.as_str()) == Some(chain_name);
@@ -125,7 +139,7 @@ fn has_dnat_map_rule_in_chain(json: &serde_json::Value, chain_name: &str) -> boo
         .and_then(|v| v.as_array())
         .map(|objects| {
             objects.iter().any(|obj| {
-                obj.get("rule")
+                object_rule(obj)
                     .and_then(|rule| {
                         let same_chain =
                             rule.get("chain").and_then(|v| v.as_str()) == Some(chain_name);
@@ -241,7 +255,7 @@ fn services_chain_has_clusterip_lookup(json: &serde_json::Value) -> bool {
         .and_then(|v| v.as_array())
         .map(|objects| {
             objects.iter().any(|obj| {
-                let Some(rule) = obj.get("rule") else {
+                let Some(rule) = object_rule(obj) else {
                     return false;
                 };
                 if rule.get("chain").and_then(|v| v.as_str()) != Some("services") {
@@ -252,6 +266,7 @@ fn services_chain_has_clusterip_lookup(json: &serde_json::Value) -> bool {
                     .map(|exprs| {
                         exprs.iter().any(|e| {
                             e.get("vmap")
+                                .or_else(|| e.get("map"))
                                 .and_then(|v| v.get("key"))
                                 .and_then(|k| k.get("concat"))
                                 .and_then(|v| v.as_array())
@@ -284,7 +299,7 @@ fn services_chain_has_nodeport_lookup(json: &serde_json::Value) -> bool {
         .and_then(|v| v.as_array())
         .map(|objects| {
             objects.iter().any(|obj| {
-                let Some(rule) = obj.get("rule") else {
+                let Some(rule) = object_rule(obj) else {
                     return false;
                 };
                 if rule.get("chain").and_then(|v| v.as_str()) != Some("services") {
@@ -295,11 +310,26 @@ fn services_chain_has_nodeport_lookup(json: &serde_json::Value) -> bool {
                     .map(|exprs| {
                         exprs.iter().any(|e| {
                             e.get("vmap")
+                                .or_else(|| e.get("map"))
                                 .and_then(|v| v.get("key"))
-                                .and_then(|k| k.get("payload"))
-                                .and_then(|p| p.get("field"))
-                                .and_then(|v| v.as_str())
-                                == Some("dport")
+                                .and_then(|k| k.get("concat"))
+                                .and_then(|v| v.as_array())
+                                .map(|parts| {
+                                    let has_proto = parts.iter().any(|p| {
+                                        p.get("payload")
+                                            .and_then(|x| x.get("field"))
+                                            .and_then(|v| v.as_str())
+                                            == Some("protocol")
+                                    });
+                                    let has_dport = parts.iter().any(|p| {
+                                        p.get("payload")
+                                            .and_then(|x| x.get("field"))
+                                            .and_then(|v| v.as_str())
+                                            == Some("dport")
+                                    });
+                                    has_proto && has_dport
+                                })
+                                .unwrap_or(false)
                         })
                     })
                     .unwrap_or(false)
@@ -315,7 +345,7 @@ fn render_key_fragments_snapshot(json: &serde_json::Value) -> String {
     };
 
     for obj in objects {
-        let Some(rule) = obj.get("rule") else {
+        let Some(rule) = object_rule(obj) else {
             continue;
         };
         let Some(chain) = rule.get("chain").and_then(|v| v.as_str()) else {
@@ -326,7 +356,9 @@ fn render_key_fragments_snapshot(json: &serde_json::Value) -> String {
         };
 
         if chain == "services"
-            && let Some(vmap) = exprs.iter().find_map(|e| e.get("vmap"))
+            && let Some(vmap) = exprs
+                .iter()
+                .find_map(|e| e.get("vmap").or_else(|| e.get("map")))
             && let Some(key_arr) = vmap
                 .get("key")
                 .and_then(|v| v.get("concat"))
@@ -345,7 +377,9 @@ fn render_key_fragments_snapshot(json: &serde_json::Value) -> String {
         }
 
         if chain.starts_with("svc-") {
-            if let Some(vmap) = exprs.iter().find_map(|e| e.get("vmap"))
+            if let Some(vmap) = exprs
+                .iter()
+                .find_map(|e| e.get("vmap").or_else(|| e.get("map")))
                 && let Some(numgen) = vmap
                     .get("key")
                     .and_then(|k| k.get("numgen"))
@@ -472,10 +506,6 @@ fn test_generate_and_check_nftables() {
         serde_json::from_str(&json).expect("generated nftables payload must be valid json");
 
     assert!(
-        has_vmap_rule_in_chain(&parsed, "services"),
-        "services chain must use vmap for service lookup"
-    );
-    assert!(
         has_dnat_map_rule_in_chain(&parsed, "svc-default-mysvc-80"),
         "service chain must use numgen+dnat-map for endpoint load balancing"
     );
@@ -495,7 +525,6 @@ fn test_generate_and_check_nftables() {
     let snapshot = render_key_fragments_snapshot(&parsed);
     let expected = [
         "mark-svc-default-mysvc-80: mark set -> svc-default-mysvc-80",
-        "services: ip.daddr + tcp.dport vmap",
         "svc-default-mysvc-80: numgen random mod 2 dnat-map",
     ]
     .join("\n");
@@ -650,6 +679,7 @@ fn test_single_backend_uses_numgen_mod_1() {
             service_type: "ClusterIP".into(),
         },
     };
+
     let ep = Endpoint {
         api_version: "v1".into(),
         kind: "Endpoints".into(),
@@ -768,31 +798,8 @@ fn test_service_discovery_contains_clusterip_and_nodeport_lookups() {
             service_type: "NodePort".into(),
         },
     };
-    let ep = Endpoint {
-        api_version: "v1".into(),
-        kind: "Endpoints".into(),
-        metadata: ObjectMeta {
-            name: "svc-discovery".into(),
-            namespace: "default".into(),
-            ..Default::default()
-        },
-        subsets: vec![EndpointSubset {
-            addresses: vec![EndpointAddress {
-                ip: "10.244.30.2".into(),
-                node_name: None,
-                target_ref: None,
-            }],
-            not_ready_addresses: vec![],
-            ports: vec![EndpointPort {
-                name: Some("http".into()),
-                port: 8080,
-                protocol: "TCP".into(),
-                app_protocol: None,
-            }],
-        }],
-    };
-
-    let json = generate_nftables_config(&[svc], &[ep]).expect("generate_nftables_config failed");
+    let json = generate_services_discovery_refresh(&[svc])
+        .expect("generate_services_discovery_refresh failed");
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json expected");
 
     assert!(
