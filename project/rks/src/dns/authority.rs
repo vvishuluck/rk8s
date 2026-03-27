@@ -708,18 +708,39 @@ pub async fn ensure_nat_prerouting_chain() -> Result<()> {
         nft_helper::get_current_ruleset_with_args(None::<&String>, ["list", "table", "ip", "nat"])
     })
     .await
-    .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
+    .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
 
-    let table_exists = current.objects.iter().any(|obj| match obj {
-        NfObject::ListObject(NfListObject::Table(t)) => t.family == NfFamily::IP && t.name == "nat",
-        _ => false,
+    let current = match current {
+        Ok(ruleset) => Some(ruleset),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No such file or directory") || msg.contains("No such file") {
+                debug!("nat table not found yet, will create table/chain: {msg}");
+                None
+            } else {
+                return Err(anyhow::anyhow!(
+                    "failed to read nat table nftables rules: {e}"
+                ));
+            }
+        }
+    };
+
+    let table_exists = current.as_ref().is_some_and(|ruleset| {
+        ruleset.objects.iter().any(|obj| match obj {
+            NfObject::ListObject(NfListObject::Table(t)) => {
+                t.family == NfFamily::IP && t.name == "nat"
+            }
+            _ => false,
+        })
     });
 
-    let chain_exists = current.objects.iter().any(|obj| match obj {
-        NfObject::ListObject(NfListObject::Chain(c)) => {
-            c.table == "nat" && c.family == NfFamily::IP && c.name == "PREROUTING"
-        }
-        _ => false,
+    let chain_exists = current.as_ref().is_some_and(|ruleset| {
+        ruleset.objects.iter().any(|obj| match obj {
+            NfObject::ListObject(NfListObject::Chain(c)) => {
+                c.table == "nat" && c.family == NfFamily::IP && c.name == "PREROUTING"
+            }
+            _ => false,
+        })
     });
 
     let mut objects: Vec<NfObject> = Vec::new();
