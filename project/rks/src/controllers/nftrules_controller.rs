@@ -614,7 +614,10 @@ impl NftablesController {
             for n in failed_nodes {
                 set.insert(n);
             }
-            return Err(anyhow!("two-phase broadcast failures for {}", reason));
+            warn!(
+                "two-phase broadcast had partial failures for reason={}; continuing with follow-up discovery refresh for healthy nodes",
+                reason
+            );
         }
 
         Ok(())

@@ -92,6 +92,14 @@ impl<'a> NodeRegister<'a> {
             self.conn.remote_address().ip()
         );
 
+        // Register worker before bootstrap rule generation so incremental
+        // broadcasts during this window can still reach this session.
+        let session = Arc::new(WorkerSession::new(msg_tx.clone(), lease));
+        self.shared
+            .node_registry
+            .register(node_id.clone(), session.clone())
+            .await;
+
         // Send current nftables rules in two phases:
         // 1) full ruleset (contains table flush)
         // 2) verdict map initialization (raw JSON)
@@ -189,15 +197,13 @@ impl<'a> NodeRegister<'a> {
             }
         }
 
-        // Register worker after initial nftables messages are queued so that
-        // incremental broadcasts do not race ahead of bootstrap rules.
-        let session = Arc::new(WorkerSession::new(msg_tx.clone(), lease));
-        self.shared
-            .node_registry
-            .register(node_id.clone(), session.clone())
-            .await;
-
-        self.conn.send_msg(&RksMessage::Ack).await?;
+        if let Err(e) = self.conn.send_msg(&RksMessage::Ack).await {
+            self.shared
+                .node_registry
+                .unregister_if_matches(&node_id, &session)
+                .await;
+            return Err(e);
+        }
 
         let conn = self.conn.clone();
         tokio::spawn(async move {
