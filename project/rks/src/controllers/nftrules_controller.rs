@@ -93,13 +93,11 @@ impl NftablesController {
                     tokio::spawn(async move {
                         info!("nftables worker start: service_key={key_cl}");
 
-                        // mark start of processing: remove queued, add to processing
+                        // mark start of processing: remove queued, add to processing atomically
                         {
                             let mut qd = queued_c.write().await;
-                            qd.remove(&key_cl);
-                        }
-                        {
                             let mut p = processing_c.write().await;
+                            qd.remove(&key_cl);
                             p.insert(key_cl.clone());
                         }
 
@@ -438,14 +436,18 @@ impl NftablesController {
                         if let Err(err) = res {
                             // retry logic
                             let mut at = attempts_c.lock().await;
-                            let cnt = at.entry(key_cl.clone()).or_insert(0);
-                            *cnt += 1;
-                            if *cnt <= max_retries_c {
+                            let (cnt, should_retry) = {
+                                let entry = at.entry(key_cl.clone()).or_insert(0);
+                                *entry += 1;
+                                (*entry, *entry <= max_retries_c)
+                            };
+
+                            if should_retry {
                                 let backoff =
-                                    200u64.saturating_mul(2u64.saturating_pow(*cnt)).min(30_000);
+                                    200u64.saturating_mul(2u64.saturating_pow(cnt)).min(30_000);
                                 let tx_retry = tx_c.clone();
                                 let key_retry = key_cl.clone();
-                                warn!(
+                                info!(
                                     "nftables worker: processing failed service_key={key_cl} attempt={cnt} backoff_ms={backoff} err={err:?}"
                                 );
                                 tokio::spawn(async move {
@@ -453,6 +455,8 @@ impl NftablesController {
                                     let _ = tx_retry.send(key_retry).await;
                                 });
                             } else {
+                                // Clear retry budget after permanent failure to allow future updates to retry.
+                                at.remove(&key_cl);
                                 warn!(
                                     "nftables worker: processing permanently failed service_key={key_cl} attempts={cnt} err={err:?}"
                                 );
