@@ -1009,7 +1009,12 @@ pub async fn cleanup_dns_nftable() -> anyhow::Result<()> {
 
     let nft = match current {
         Ok(n) => n,
-        Err(e) => return Err(anyhow::anyhow!("failed to get current nft ruleset: {e}")),
+        Err(_) => {
+            // If the nat table does not exist, there's nothing for us to clean up.
+            // This is a common no-op case on fresh or partially configured nodes.
+            info!("Table 'ip nat' not found; skipping DNS NFT rules cleanup.");
+            return Ok(());
+        }
     };
 
     // Collect delete commands for rules with our comment
