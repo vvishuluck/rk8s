@@ -609,15 +609,19 @@ impl NftablesController {
         let map_init_msg = common::RksMessage::SetNftablesRules(map_init_rules.clone());
         let mut failed_nodes = Vec::new();
 
+        const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
         for (node_id, session) in sessions {
             info!(
                 "two-phase broadcast phase=full_rules node={} reason={}",
                 node_id, reason
             );
-            if let Err(e) = session.tx.try_send(full_msg.clone()) {
+
+            let res = tokio::time::timeout(SEND_TIMEOUT, session.tx.send(full_msg.clone())).await;
+            if let Err(_) | Ok(Err(_)) = res {
                 warn!(
-                    "two-phase broadcast failed at phase=full_rules node={} reason={} err={}",
-                    node_id, reason, e
+                    "two-phase broadcast failed at phase=full_rules node={} reason={} err=timeout or closed",
+                    node_id, reason
                 );
                 failed_nodes.push(node_id);
                 continue;
@@ -627,10 +631,12 @@ impl NftablesController {
                 "two-phase broadcast phase=map_init node={} reason={}",
                 node_id, reason
             );
-            if let Err(e) = session.tx.try_send(map_init_msg.clone()) {
+            let res =
+                tokio::time::timeout(SEND_TIMEOUT, session.tx.send(map_init_msg.clone())).await;
+            if let Err(_) | Ok(Err(_)) = res {
                 warn!(
-                    "two-phase broadcast failed at phase=map_init node={} reason={} err={}",
-                    node_id, reason, e
+                    "two-phase broadcast failed at phase=map_init node={} reason={} err=timeout or closed",
+                    node_id, reason
                 );
                 failed_nodes.push(node_id);
             }
@@ -759,11 +765,15 @@ impl NftablesController {
 
         let msg = common::RksMessage::UpdateNftablesRules(json_rules);
         let mut failed_nodes = Vec::new();
+
+        const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
         for (node_id, session) in sessions {
-            if let Err(e) = session.tx.try_send(msg.clone()) {
+            let res = tokio::time::timeout(SEND_TIMEOUT, session.tx.send(msg.clone())).await;
+            if let Err(_) | Ok(Err(_)) = res {
                 warn!(
-                    "discovery refresh broadcast failed node={} reason={} err={}",
-                    node_id, reason, e
+                    "discovery refresh broadcast failed node={} reason={} err=timeout or closed",
+                    node_id, reason
                 );
                 failed_nodes.push(node_id);
             }
@@ -810,9 +820,15 @@ impl NftablesController {
 
         let mut failed_nodes = Vec::new();
 
+        const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
         for (node_id, session) in sessions {
-            if let Err(e) = session.tx.try_send(msg.clone()) {
-                warn!("Failed to send rules to node {}: {}", node_id, e);
+            let res = tokio::time::timeout(SEND_TIMEOUT, session.tx.send(msg.clone())).await;
+            if let Err(_) | Ok(Err(_)) = res {
+                warn!(
+                    "Failed to send rules to node {} (timeout or closed)",
+                    node_id
+                );
                 failed_nodes.push(node_id);
             }
         }

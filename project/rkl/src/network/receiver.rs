@@ -469,24 +469,30 @@ fn apply_map_init_payload_with_repair(node_id: &str, raw_rules: &str) -> Result<
         Ok(_) => Ok(()),
         Err(err) => {
             let err_text = err.to_string();
-            if !err_text.contains("File exists") {
+            // "datatype mismatch" indicates we're trying to use new concat keys on an old map type.
+            // "File exists" means the map already exist but could be of the wrong type.
+            if !err_text.contains("File exists") && !err_text.contains("datatype mismatch") {
                 return Err(err);
             }
 
-            if nodeports_map_is_protocol_aware() {
+            if cluster_ips_map_is_protocol_aware() && nodeports_map_is_protocol_aware() {
                 info!(
-                    "map_init payload is already applied on node {}; treating File exists as success",
+                    "map_init payload is already upgraded on node {}; treating error as success if already applied",
                     node_id
                 );
-                return Ok(());
+                // If it's a datatype mismatch, we still have a problem if it's not actually upgraded.
+                // But the check above should be authoritative.
+                if err_text.contains("File exists") {
+                    return Ok(());
+                }
             }
 
             warn!(
-                "map_init apply hit File exists on node {}; trying verdict-map repair and retry",
+                "map_init apply failed (exists/mismatch) on node {}; trying verdict-map repair and retry",
                 node_id
             );
 
-            // Best-effort cleanup for stale verdict maps (e.g. old node_ports type).
+            // Best-effort cleanup for stale verdict maps (e.g. old node_ports/cluster_ips type).
             // Ignore missing-map errors so retry remains idempotent.
             best_effort_delete_map(RK8S_TABLE_NAME, RK8S_MAP_NODE_PORTS);
             best_effort_delete_map(RK8S_TABLE_NAME, RK8S_MAP_CLUSTER_IPS);
@@ -527,6 +533,24 @@ fn apply_ruleset_raw_with_output(raw_rules: &str) -> Result<()> {
         stdout,
         stderr
     ))
+}
+
+fn cluster_ips_map_is_protocol_aware() -> bool {
+    let output = match Command::new("nft")
+        .args(["list", "map", "ip", RK8S_TABLE_NAME, RK8S_MAP_CLUSTER_IPS])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return false,
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    // type inet_proto . ipv4_addr . inet_service
+    stdout.contains("type inet_proto . ipv4_addr . inet_service")
 }
 
 fn nodeports_map_is_protocol_aware() -> bool {

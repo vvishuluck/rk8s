@@ -69,7 +69,7 @@ pub fn generate_verdict_maps_init_raw_json() -> Result<String> {
                     "family": "ip",
                     "table": TABLE_NAME,
                     "name": MAP_CLUSTER_IPS,
-                    "type": ["ipv4_addr", "inet_service"],
+                    "type": ["inet_proto", "ipv4_addr", "inet_service"],
                     "map": "verdict"
                 }
             },
@@ -288,7 +288,7 @@ fn generate_service_update_objects(
 
     for svc_port in &svc.spec.ports {
         let protocol = svc_port.protocol.to_lowercase();
-        let chain_name = service_chain_name(svc, svc_port.port);
+        let chain_name = service_chain_name(svc, svc_port.port, &protocol);
         let mark_chain_name = service_mark_chain_name(&chain_name);
 
         // 1. Create Chain
@@ -388,7 +388,7 @@ fn generate_service_backend_only_update_objects(
 
     for svc_port in &svc.spec.ports {
         let protocol = svc_port.protocol.to_lowercase();
-        let chain_name = service_chain_name(svc, svc_port.port);
+        let chain_name = service_chain_name(svc, svc_port.port, &protocol);
 
         // Endpoint-only incremental path: service/mark chains are expected to
         // already exist; only refresh backend dispatch rule in service chain.
@@ -443,7 +443,8 @@ pub fn generate_service_update_with_old_endpoint(
 
     if legacy_endpoint_chains {
         for svc_port in &svc.spec.ports {
-            let chain_name = service_chain_name(svc, svc_port.port);
+            let protocol = svc_port.protocol.to_lowercase();
+            let chain_name = service_chain_name(svc, svc_port.port, &protocol);
             let element_state = service_port_backend_elements_state(svc_port, old_ep, new_ep);
             let stale_actual = element_state.stale_actual_elements();
 
@@ -494,7 +495,8 @@ pub fn generate_service_detach_with_endpoint(
     let legacy_endpoint_chains = use_legacy_endpoint_chains();
 
     for svc_port in &svc.spec.ports {
-        let chain_name = service_chain_name(svc, svc_port.port);
+        let protocol = svc_port.protocol.to_lowercase();
+        let chain_name = service_chain_name(svc, svc_port.port, &protocol);
         let mark_chain_name = service_mark_chain_name(&chain_name);
 
         // Phase 1: break references only (safe in one transaction with discovery refresh).
@@ -548,7 +550,8 @@ pub fn generate_service_delete_with_endpoint(
     let legacy_endpoint_chains = use_legacy_endpoint_chains();
 
     for svc_port in &svc.spec.ports {
-        let chain_name = service_chain_name(svc, svc_port.port);
+        let protocol = svc_port.protocol.to_lowercase();
+        let chain_name = service_chain_name(svc, svc_port.port, &protocol);
         let mark_chain_name = service_mark_chain_name(&chain_name);
 
         // 1) Remove mark->svc reference first, then svc rule refs.
@@ -797,10 +800,10 @@ struct ServiceLookupMaps {
     service_nodeports_udp: Vec<expr::SetItem<'static>>,
 }
 
-fn service_chain_name(svc: &common::ServiceTask, port: i32) -> String {
+fn service_chain_name(svc: &common::ServiceTask, port: i32, protocol: &str) -> String {
     format!(
-        "svc-{}-{}-{}",
-        svc.metadata.namespace, svc.metadata.name, port
+        "svc-{}-{}-{}-{}",
+        svc.metadata.namespace, svc.metadata.name, protocol, port
     )
 }
 
@@ -828,7 +831,7 @@ fn build_service_lookup_maps(services: &[common::ServiceTask]) -> ServiceLookupM
         let cluster_ip = valid_cluster_ip(svc);
         for svc_port in &svc.spec.ports {
             let protocol = svc_port.protocol.to_lowercase();
-            let chain_name = service_chain_name(svc, svc_port.port);
+            let chain_name = service_chain_name(svc, svc_port.port, &protocol);
             let mark_chain_name = service_mark_chain_name(&chain_name);
 
             if let Some(cluster_ip) = cluster_ip {
@@ -929,6 +932,12 @@ fn cluster_ip_lookup_key_expr(protocol: String) -> expr::Expression<'static> {
         expr::Expression::Named(expr::NamedExpression::Payload(expr::Payload::PayloadField(
             expr::PayloadField {
                 protocol: Cow::Borrowed("ip"),
+                field: Cow::Borrowed("protocol"),
+            },
+        ))),
+        expr::Expression::Named(expr::NamedExpression::Payload(expr::Payload::PayloadField(
+            expr::PayloadField {
+                protocol: Cow::Borrowed("ip"),
                 field: Cow::Borrowed("daddr"),
             },
         ))),
@@ -960,10 +969,11 @@ fn nodeport_lookup_key_expr(protocol: String) -> expr::Expression<'static> {
 
 fn service_ips_map_key_expr(
     cluster_ip: &str,
-    _protocol: &str,
+    protocol: &str,
     port: u32,
 ) -> expr::Expression<'static> {
     expr::Expression::Named(expr::NamedExpression::Concat(vec![
+        expr::Expression::Number(l4proto_number(protocol)),
         expr::Expression::String(Cow::Owned(cluster_ip.to_string())),
         expr::Expression::Number(port),
     ]))
