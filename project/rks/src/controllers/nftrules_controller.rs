@@ -21,7 +21,10 @@ use tokio::time::{Duration, sleep};
 pub struct NftablesController {
     xline_store: Arc<XlineStore>,
     node_registry: Arc<NodeRegistry>,
+    // Nodes that failed full-sync bootstrap (map_init + full_rules)
     out_of_sync: Arc<Mutex<HashSet<String>>>,
+    // Nodes that failed recent incremental/discovery updates (generic retry)
+    recent_failed: Arc<Mutex<HashSet<String>>>,
 
     // work queue for service key level debounce
     queue_tx: mpsc::Sender<String>,
@@ -45,6 +48,7 @@ impl NftablesController {
             xline_store,
             node_registry,
             out_of_sync: Arc::new(Mutex::new(HashSet::new())),
+            recent_failed: Arc::new(Mutex::new(HashSet::new())),
             queue_tx: tx,
             queue_rx: Some(rx),
             queued: Arc::new(RwLock::new(HashSet::new())),
@@ -208,10 +212,7 @@ impl NftablesController {
                                             }
 
                                             if !failed_nodes.is_empty() {
-                                                let mut set = out_of_sync_c.lock().await;
-                                                for n in failed_nodes {
-                                                    set.insert(n);
-                                                }
+                                                Self::record_out_of_sync_static(&out_of_sync_c, &failed_nodes).await;
                                                 return Err(anyhow::anyhow!("broadcast failures for {}", mode));
                                             }
                                         }
@@ -647,10 +648,7 @@ impl NftablesController {
         }
 
         if !failed_nodes.is_empty() {
-            let mut set = out_of_sync.lock().await;
-            for n in &failed_nodes {
-                set.insert(n.clone());
-            }
+            Self::record_out_of_sync_static(out_of_sync, &failed_nodes).await;
 
             Self::retry_two_phase_broadcast(
                 node_registry.clone(),
@@ -838,25 +836,35 @@ impl NftablesController {
         }
 
         if !failed_nodes.is_empty() {
-            self.record_out_of_sync(&failed_nodes).await;
-            self.retry_broadcast(msg).await;
+            let mut rf = self.recent_failed.lock().await;
+            for node_id in &failed_nodes {
+                rf.insert(node_id.clone());
+            }
+            // Start retry background task targeting only these failed nodes
+            Self::retry_broadcast_static(
+                self.node_registry.clone(),
+                self.recent_failed.clone(),
+                msg,
+            )
+            .await;
         }
-        Ok(!failed_nodes.is_empty())
+        Ok(failed_nodes.is_empty())
     }
 
-    async fn record_out_of_sync(&self, nodes: &[String]) {
-        let mut set = self.out_of_sync.lock().await;
+    async fn record_out_of_sync_static(tracker: &Arc<Mutex<HashSet<String>>>, nodes: &[String]) {
+        let mut set = tracker.lock().await;
         for n in nodes {
             set.insert(n.clone());
         }
     }
 
-    async fn retry_broadcast(&self, msg: common::RksMessage) {
+    async fn retry_broadcast_static(
+        registry: Arc<NodeRegistry>,
+        tracker: Arc<Mutex<HashSet<String>>>,
+        msg: common::RksMessage,
+    ) {
         const MAX_ATTEMPTS: usize = 3;
         const BACKOFF_MS: u64 = 300;
-
-        let registry = self.node_registry.clone();
-        let tracker = self.out_of_sync.clone();
 
         tokio::spawn(async move {
             for attempt in 1..=MAX_ATTEMPTS {
@@ -864,7 +872,7 @@ impl NftablesController {
                 sleep(Duration::from_millis(BACKOFF_MS * attempt as u64)).await;
 
                 let nodes: Vec<String> = {
-                    let set = tracker.lock().await;
+                    let set: tokio::sync::MutexGuard<'_, HashSet<String>> = tracker.lock().await;
                     set.iter().cloned().collect()
                 };
 
@@ -876,17 +884,22 @@ impl NftablesController {
                 for node_id in nodes {
                     match registry.get(&node_id).await {
                         Some(session) => {
-                            if let Err(e) = session.tx.try_send(msg.clone()) {
-                                warn!(
-                                    "Retry {}/{} failed to send rules to node {}: {}",
-                                    attempt, MAX_ATTEMPTS, node_id, e
-                                );
-                            } else {
+                            let res = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                session.tx.send(msg.clone()),
+                            )
+                            .await;
+                            if let Ok(Ok(_)) = res {
                                 info!(
                                     "Retry {}/{} succeeded sending rules to node {}",
                                     attempt, MAX_ATTEMPTS, node_id
                                 );
                                 successes.push(node_id);
+                            } else {
+                                warn!(
+                                    "Retry {}/{} failed to send rules to node {}",
+                                    attempt, MAX_ATTEMPTS, node_id
+                                );
                             }
                         }
                         None => {
@@ -899,7 +912,8 @@ impl NftablesController {
                 }
 
                 if !successes.is_empty() {
-                    let mut set = tracker.lock().await;
+                    let mut set: tokio::sync::MutexGuard<'_, HashSet<String>> =
+                        tracker.lock().await;
                     for n in successes {
                         set.remove(&n);
                     }
@@ -912,12 +926,12 @@ impl NftablesController {
             }
 
             let remaining: Vec<String> = {
-                let set = tracker.lock().await;
+                let set: tokio::sync::MutexGuard<'_, HashSet<String>> = tracker.lock().await;
                 set.iter().cloned().collect()
             };
             if !remaining.is_empty() {
                 warn!(
-                    "Exhausted retries for nodes: {:?}; they remain out-of-sync until next full sync",
+                    "Exhausted retries for nodes (recent failed): {:?}; incremental rules may be missing",
                     remaining
                 );
             }
