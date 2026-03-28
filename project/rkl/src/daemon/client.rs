@@ -387,6 +387,13 @@ pub async fn run_once(
                                 let _ = client.send_msg(&RksMessage::Ack).await;
                             }
                         }
+                        Ok(RksMessage::SetRegistryCredentials(creds)) => {
+                            info!(
+                                "[worker] received {} registry credential(s) from rks",
+                                creds.len()
+                            );
+                            crate::config::set_registry_credentials(creds);
+                        }
                         Ok(RksMessage::SetNftablesRules(rules)) => {
                             let phase = nft_rules_phase(&rules);
                             info!(
